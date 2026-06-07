@@ -28,6 +28,8 @@ from torch._inductor.graph import GraphLowering
 from torch._inductor.ir import ComputedBuffer, Operation
 from torch._inductor.scheduler import BaseSchedulerNode
 
+from .dtype_conversion import insert_dtype_conversions
+
 from .logging_utils import get_inductor_logger
 
 from .padding import insert_bmm_padding
@@ -129,7 +131,7 @@ class CustomPrePasses(CustomGraphPass):
     """
     The list of custom passes to run
     """
-    passes: List[Callable[[torch.fx.graph.Graph], None]] = [collect_spyre_hints]
+    passes: List[Callable[[torch.fx.graph.Graph], None]] = [insert_dtype_conversions,collect_spyre_hints]
 
     def __call__(self, graph: torch.fx.graph.Graph) -> None:
         for p in CustomPrePasses.passes:

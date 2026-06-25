@@ -280,7 +280,7 @@ def _single_arg_op_layout(
             in_elems_per_stick = get_elem_in_stick(in_layout.dtype)
             stick_dim_size = in_layout.size[-1]
             fmt = ElementArrangement.STANDARD
-            if in_layout.dtype == torch.float16 and output.dtype == torch.float32:
+            if in_layout.dtype in (torch.float16, torch.bfloat16) and output.dtype == torch.float32:
                 fmt = ElementArrangement.DL16_TO_FP32
             unaligned = concretize_expr(stick_dim_size % in_elems_per_stick)
 

@@ -648,7 +648,28 @@ def is_stick_expr_offset_free(stick_expr: sympy.Expr, elems_per_stick: int) -> b
     )
     is_bare_var = stick_expr.is_symbol
     is_zero = stick_expr == sympy.S.Zero
-    return is_supported_mod or is_bare_var or is_zero
+
+    # NEW: handle scaled expressions k*Mod(var, N) and k*var
+    is_scaled = False
+    if isinstance(stick_expr, sympy.Mul):
+        # sympy.Mul args are the factors: 2*Mod(d1,32) → args = (2, Mod(d1,32))
+        const_args = [a for a in stick_expr.args if a.is_Integer and a > 0]
+        sym_args   = [a for a in stick_expr.args if not a.is_Integer]
+        if len(const_args) == 1 and len(sym_args) == 1:
+            k    = int(const_args[0])
+            inner = sym_args[0]
+            # k * Mod(var, elems_per_stick/k)
+            is_scaled_mod = (
+                isinstance(inner, sympy.Mod)
+                and len(inner.args[0].free_symbols) == 1
+                and inner.args[1] == elems_per_stick // k
+                and elems_per_stick % k == 0   # k must divide evenly into stick
+            )
+            # k * var
+            is_scaled_var = inner.is_symbol
+            is_scaled = is_scaled_mod or is_scaled_var
+
+    return is_supported_mod or is_bare_var or is_zero or is_scaled
 
 
 def _is_stick_expr_with_offset(stick_expr: sympy.Expr, elems_per_stick: int) -> bool:

@@ -18,7 +18,9 @@
 # --parallel detects the number of Spyre cards from PCIDEVICE_IBM_COM_AIU_PF
 # (comma count+1) or torch.spyre.device_count(), then distributes the resolved
 # test files round-robin across cards, running each card's slice in a
-# background subshell with SPYRE_DEVICES=<card_idx>.  Falls back to serial
+# background subshell with SPYRE_DEVICES=<physical_device_id> (honouring an
+# already-set SPYRE_DEVICES list such as "1,5,7" rather than assuming
+# 0..N-1).  Falls back to serial
 # execution when only one card is detected.  JUnit XML shards from all cards
 # are merged into the single --junit-xml destination at the end.
 
@@ -1452,6 +1454,31 @@ _add_suite_counts() {
 }
 
 # ---------------------------------------------------------------------------
+# Per-file result tracking — always collected (not just multi-config).
+# _FILE_SUMMARY_LABELS[i]  : display name (basename of original test file)
+# _FILE_SUMMARY_STATUS[i]  : PASS | FAIL | SIGNAL | NOTEST | ERROR
+# _FILE_SUMMARY_COUNTS[i]  : "passed failed error skipped xfailed xpassed time"
+# _ALL_FAILED_TESTS[]      : accumulated failed test node IDs, one per entry
+# ---------------------------------------------------------------------------
+_FILE_SUMMARY_LABELS=()
+_FILE_SUMMARY_STATUS=()
+_FILE_SUMMARY_COUNTS=()
+_ALL_FAILED_TESTS=()
+
+# _extract_failed_tests <output_file>
+# Prints one failed test node ID per line from pytest short summary section.
+_extract_failed_tests() {
+    local _f="$1"
+    [[ -f "$_f" ]] || return
+    grep -E '^FAILED ' "$_f" \
+        | sed 's/^FAILED //' \
+        | sed 's/ -.*//' \
+        | sed 's/^\[TAGS[^]]*\] //' \
+        | sed 's/__oot_wrapper//' \
+        | grep '::'
+}
+
+# ---------------------------------------------------------------------------
 # _parse_pytest_summary_line <output_file>
 #
 # Reads the captured pytest output file, finds the terminal summary line
@@ -1647,6 +1674,9 @@ _run_xdist_fallback() {
             echo "[torch_oot_device_tests_run]          Install with: pip install pytest-xdist" >&2
             echo "[torch_oot_device_tests_run]          Skipping remaining tests in: $_orig" >&2
             [[ $OVERALL_EXIT -eq 0 ]] && OVERALL_EXIT=1
+            _FILE_SUMMARY_LABELS+=("$(basename "$_orig") [signal/no-xdist]")
+            _FILE_SUMMARY_STATUS+=("SIGNAL")
+            _FILE_SUMMARY_COUNTS+=("0 0 0 0 0 0 0")
             return
         fi
     fi
@@ -1665,10 +1695,32 @@ _run_xdist_fallback() {
         echo "[torch_oot_device_tests_run] WARNING: xdist fallback subshell exited abnormally for $_orig" >&2
     fi
 
-    # Accumulate per-suite counts from xdist output (multi-config only).
-    if [[ ${#YAML_CONFIGS[@]} -ge 2 && -n "$_suite_lbl" && -f "$_xdist_out_tmp" ]]; then
+    # Track per-file results and collect failed test names from xdist run.
+    _xdist_display="$(basename "$_orig")"
+    if [[ -f "$_xdist_out_tmp" ]]; then
         read -r _sp _sf _se _ss _sxf _sxp _st <<< "$(_parse_pytest_summary_line "$_xdist_out_tmp")"
-        _add_suite_counts "$_suite_lbl" "${_sp:-0}" "${_sf:-0}" "${_se:-0}" "${_ss:-0}" "${_sxf:-0}" "${_sxp:-0}" "${_st:-0}"
+        # Accumulate per-suite counts (multi-config).
+        if [[ ${#YAML_CONFIGS[@]} -ge 2 && -n "$_suite_lbl" ]]; then
+            _add_suite_counts "$_suite_lbl" "${_sp:-0}" "${_sf:-0}" "${_se:-0}" "${_ss:-0}" "${_sxf:-0}" "${_sxp:-0}" "${_st:-0}"
+        fi
+        # Record per-file result for end-of-run summary.
+        case $_xexit in
+            0) _xfstatus="PASS" ;;
+            1) _xfstatus="FAIL" ;;
+            5) _xfstatus="NOTEST" ;;
+            *) _xfstatus="SIGNAL" ;;
+        esac
+        _FILE_SUMMARY_LABELS+=("${_xdist_display} [xdist]")
+        _FILE_SUMMARY_STATUS+=("$_xfstatus")
+        _FILE_SUMMARY_COUNTS+=("${_sp:-0} ${_sf:-0} ${_se:-0} ${_ss:-0} ${_sxf:-0} ${_sxp:-0} ${_st:-0}")
+        # Collect failed test names.
+        while IFS= read -r _fn; do
+            [[ -n "$_fn" ]] && _ALL_FAILED_TESTS+=("$_fn")
+        done < <(_extract_failed_tests "$_xdist_out_tmp")
+    else
+        _FILE_SUMMARY_LABELS+=("${_xdist_display} [signal]")
+        _FILE_SUMMARY_STATUS+=("SIGNAL")
+        _FILE_SUMMARY_COUNTS+=("0 0 0 0 0 0 0")
     fi
     rm -f "$_xdist_out_tmp"
 
@@ -1694,9 +1746,16 @@ _run_xdist_fallback() {
 #   1. PCIDEVICE_IBM_COM_AIU_PF: contains a comma-separated list of PCI bus IDs per card.
 #      Card count = number of commas + 1.
 #   2. torch.spyre.device_count(): runtime query via the flex driver.
-#      Respects the AIU_WORLD_SIZE / SPYRE_DEVICES if already set, so we clear
-#      those for the probe to get the raw hardware count.
-#   3. Falls back to 1 (serial) if neither source yields > 0.
+#      Inherits AIU_WORLD_SIZE / SPYRE_DEVICES from the environment as-is.
+#      flex::getNumDevices() (see spyre_device_enum.cpp) already narrows its
+#      count to those vars when either is set, so if the caller has
+#      restricted visible devices that restriction is naturally honoured
+#      here. Clearing them before the probe (as this used to do) would let
+#      --parallel spread tests across cards the caller never authorized for
+#      this run.
+#   3. Falls back to 1 (serial) if neither source yields > 0. On failure, the
+#      probe's stderr is surfaced so import/runtime errors are diagnosable
+#      instead of silently downgrading to serial execution.
 #
 # ---------------------------------------------------------------------------
 _detect_spyre_card_count() {
@@ -1707,22 +1766,30 @@ _detect_spyre_card_count() {
         return
     fi
 
-    # Alternately torch.spyre.device_count() without any env overrides
-    local _count
+    local _count _probe_err
+    _probe_err="/tmp/_spyre_card_probe_err_${$}.tmp"
     _count=$(
-        env -u AIU_WORLD_SIZE -u SPYRE_DEVICES \
         python3 -c "
-import torch_spyre, torch
+import sys
+import torch
 try:
     print(torch.spyre.device_count())
-except Exception:
+except Exception as e:
+    print(e, file=sys.stderr)
     print(0)
-" 2>/dev/null
+" 2>"$_probe_err"
     ) || true
     if [[ "$_count" =~ ^[0-9]+$ && "$_count" -gt 0 ]]; then
+        rm -f "$_probe_err"
         echo "$_count"
         return
     fi
+
+    if [[ -s "$_probe_err" ]]; then
+        echo "[torch_oot_device_tests_run] WARNING: Spyre card-count probe failed -- falling back to 1 card. Error was:" >&2
+        sed 's/^/[torch_oot_device_tests_run]     /' "$_probe_err" >&2
+    fi
+    rm -f "$_probe_err"
 
     # Fallback: single card serial
     echo 1
@@ -1733,7 +1800,9 @@ except Exception:
 #
 # Collects every test node ID from ALL resolved files, distributes them
 # round-robin across N Spyre cards, and runs each card's slice in a
-# background subshell with SPYRE_DEVICES=<card_idx>.
+# background subshell with SPYRE_DEVICES=<physical_device_id> -- the actual
+# device index (e.g. from an already-set SPYRE_DEVICES list such as
+# "1,5,7"), not the 0..N-1 round-robin slot.
 #
 # Splitting at the test-ID level (not the file level) is essential: when
 # multiple configs share a single test file (e.g. all inductor shard configs
@@ -1757,6 +1826,13 @@ _run_parallel_across_cards() {
     echo ""
     echo "[torch_oot_device_tests_run_parallel] --parallel: collecting test IDs from ${#RUN_FILES[@]} file(s) to distribute across ${_n_cards} card(s)..."
 
+    # Timestamp the collection phase so its cost is visible in the run log.
+    # Collection re-imports torch + each OOT wrapper per file, so this phase
+    # can dominate --parallel wall-clock; the elapsed line lets a pod run
+    # confirm the fan-out speedup empirically. SECONDS is a bash builtin
+    # (seconds since shell start) — no external `date` dependency.
+    local _collect_start=$SECONDS
+
     # -----------------------------------------------------------------------
     # Step 1: collect all test node IDs across every resolved file.
     #
@@ -1772,45 +1848,81 @@ _run_parallel_across_cards() {
     # Per-file collection is done with SPYRE_TEST_FILE set (so the OOT
     # framework can identify the config) but without SPYRE_DEVICES / hardware
     # initialisation so collection is fast even on a login node.
+    #
+    # Collection needs no hardware, so the per-file `--collect-only` probes
+    # are fanned out as background jobs (bounded to _n_cards concurrent) and
+    # each writes its raw node IDs to a per-file temp file. Running them
+    # serially and foreground here was the dominant cost of --parallel (every
+    # OOT wrapper re-imports torch + re-execs the module + regenerates the
+    # full device-type variant matrix), so parallelising the probes removes
+    # that serial bottleneck. The results are then read back in file order so
+    # _all_node_ids / _all_node_file_idx ordering is identical to the serial
+    # collection this replaces.
     # -----------------------------------------------------------------------
     # _all_node_ids: parallel arrays — node_id, file_idx (into RUN_FILES)
     local -a _all_node_ids=()
     local -a _all_node_file_idx=()
 
+    # Build the -m probe args once (identical for every file, same as serial path).
+    local -a _collect_args=()
+    local _has_m=0
+    for _a in "${_EXTRA_NO_XML[@]+"${_EXTRA_NO_XML[@]}"}"; do
+        [[ "$_a" == "-m" ]] && { _has_m=1; break; }
+    done
+    if [[ $_has_m -eq 1 ]]; then
+        local _take_next=0
+        for _a in "${_EXTRA_NO_XML[@]+"${_EXTRA_NO_XML[@]}"}"; do
+            if [[ $_take_next -eq 1 ]]; then
+                _collect_args+=("$_a"); _take_next=0; continue
+            fi
+            [[ "$_a" == "-m" ]] && { _collect_args+=("$_a"); _take_next=1; }
+        done
+    fi
+
+    # Fan out collection: one background probe per file, bounded to _n_cards
+    # concurrent jobs. Each writes matched node IDs to _collect_out_files[i].
+    local -a _collect_out_files=()
+    local -a _collect_pids=()
     for i in "${!RUN_FILES[@]}"; do
         local _rf="${RUN_FILES[$i]}"
-        local _of="${TEST_FILES[$i]}"
         local _rd _rb
         _rd="$(dirname "$_rf")"
         _rb="$(basename "$_rf")"
+        local _cout="/tmp/_spyre_collect_ids_${$}_${i}.tmp"
+        _collect_out_files+=("$_cout")
 
-        echo "[torch_oot_device_tests_run]   collecting: $(basename "$_of")"
+        echo "[torch_oot_device_tests_run]   collecting: $(basename "${TEST_FILES[$i]}")"
 
-        # Build the -m probe args (same as serial path).
-        local -a _collect_args=()
-        local _has_m=0
-        for _a in "${_EXTRA_NO_XML[@]+"${_EXTRA_NO_XML[@]}"}"; do
-            [[ "$_a" == "-m" ]] && { _has_m=1; break; }
-        done
-        if [[ $_has_m -eq 1 ]]; then
-            local _take_next=0
-            for _a in "${_EXTRA_NO_XML[@]+"${_EXTRA_NO_XML[@]}"}"; do
-                if [[ $_take_next -eq 1 ]]; then
-                    _collect_args+=("$_a"); _take_next=0; continue
-                fi
-                [[ "$_a" == "-m" ]] && { _collect_args+=("$_a"); _take_next=1; }
-            done
-        fi
-
-        local _raw_ids
-        _raw_ids=$(
+        (
             export SPYRE_TEST_FILE="$_rf"
             export OOT_TEST_FILE="$_rf"
             cd "$_rd" && python3 -m pytest "$_rb" \
                 "${_collect_args[@]+"${_collect_args[@]}"}" \
                 --collect-only -q --no-header 2>/dev/null \
-            | grep '\.py::' || true
-        )
+            | grep '\.py::' > "$_cout" || true
+        ) &
+        _collect_pids+=($!)
+
+        # Throttle to at most _n_cards concurrent probes.
+        while [[ "$(jobs -rp | wc -l)" -ge "$_n_cards" ]]; do
+            wait -n 2>/dev/null || true
+        done
+    done
+
+    # Wait for any remaining probes to finish before reading their output.
+    for _cpid in "${_collect_pids[@]+"${_collect_pids[@]}"}"; do
+        wait "$_cpid" 2>/dev/null || true
+    done
+
+    # Read back each file's collected IDs in file order, preserving the exact
+    # ordering the original serial loop produced.
+    for i in "${!RUN_FILES[@]}"; do
+        local _of="${TEST_FILES[$i]}"
+        local _cout="${_collect_out_files[$i]}"
+
+        local _raw_ids=""
+        [[ -f "$_cout" ]] && _raw_ids="$(< "$_cout")"
+        rm -f "$_cout"
 
         if [[ -z "$_raw_ids" ]]; then
             echo "[torch_oot_device_tests_run_serial]   WARNING: no test IDs collected from $(basename "$_of") -- it will be skipped in parallel mode." >&2
@@ -1835,6 +1947,9 @@ _run_parallel_across_cards() {
             _all_node_file_idx+=("$i")
         done <<< "$_raw_ids"
     done
+
+    local _collect_elapsed=$(( SECONDS - _collect_start ))
+    echo "[torch_oot_device_tests_run_parallel] Collection phase completed in ${_collect_elapsed}s (${#RUN_FILES[@]} file(s), up to ${_n_cards} concurrent probe(s))."
 
     local _total="${#_all_node_ids[@]}"
     if [[ $_total -eq 0 ]]; then
@@ -1866,12 +1981,36 @@ _run_parallel_across_cards() {
         echo "${_all_node_file_idx[$j]}:${_all_node_ids[$j]}" >> "${_card_id_files[$_k]}"
     done
 
+    # -----------------------------------------------------------------------
+    # Card-slot -> physical SPYRE_DEVICES index mapping.
+    #
+    # _n_cards is a count (e.g. 3), not a list of physical device indices.
+    # When the caller restricted visible devices with SPYRE_DEVICES (e.g.
+    # "1,5,7"), device_count() already narrows the detected count to match,
+    # but the physical indices are NOT 0..N-1 -- they are exactly the values
+    # listed. Each per-card subshell must export its real index, not its
+    # position in the round-robin loop, or it ends up targeting cards the
+    # caller never listed (e.g. card 0 when only 1,5,7 were authorized).
+    # -----------------------------------------------------------------------
+    local -a _CARD_DEVICE_IDS=()
+    if [[ -n "${SPYRE_DEVICES:-}" ]]; then
+        IFS=',' read -r -a _CARD_DEVICE_IDS <<< "${SPYRE_DEVICES}"
+    fi
+    if [[ "${#_CARD_DEVICE_IDS[@]}" -ne "$_n_cards" ]]; then
+        # No restriction (or a mismatched one) -- fall back to the natural
+        # 0..N-1 physical indexing.
+        _CARD_DEVICE_IDS=()
+        for (( _k=0; _k<_n_cards; _k++ )); do
+            _CARD_DEVICE_IDS+=("$_k")
+        done
+    fi
+
     # Print the assignment summary.
     for (( _k=0; _k<_n_cards; _k++ )); do
         local _cnt
         _cnt=$(wc -l < "${_card_id_files[$_k]}" 2>/dev/null || echo 0)
         _cnt="${_cnt// /}"   # trim whitespace
-        echo "[torch_oot_device_tests_run_parallel_info]   card ${_k} (SPYRE_DEVICES=${_k}): ${_cnt} test(s)"
+        echo "[torch_oot_device_tests_run_parallel_info]   card ${_k} (SPYRE_DEVICES=${_CARD_DEVICE_IDS[$_k]}): ${_cnt} test(s)"
     done
     echo ""
 
@@ -1886,26 +2025,32 @@ _run_parallel_across_cards() {
     local -a _card_exit_files=()
     local -a _card_shard_list_files=()
     local -a _card_counts_files=()
+    local -a _card_summary_files=()
 
     for (( _k=0; _k<_n_cards; _k++ )); do
         local _card_exit_tmp="/tmp/_spyre_card_exit_${$}_${_k}.tmp"
         local _card_shard_list="/tmp/_spyre_card_shards_${$}_${_k}.tmp"
         local _card_counts_file="/tmp/_spyre_card_counts_${$}_${_k}.tmp"
+        local _card_summary_file="/tmp/_spyre_card_summary_${$}_${_k}.tmp"
         _card_exit_files+=("$_card_exit_tmp")
         _card_shard_list_files+=("$_card_shard_list")
         _card_counts_files+=("$_card_counts_file")
+        _card_summary_files+=("$_card_summary_file")
         : > "$_card_shard_list"
         : > "$_card_counts_file"
+        : > "$_card_summary_file"
 
         local _subshell_card="$_k"
+        local _subshell_device_id="${_CARD_DEVICE_IDS[$_k]}"
         local _subshell_id_file="${_card_id_files[$_k]}"
         local _subshell_exit_tmp="$_card_exit_tmp"
         local _subshell_shard_list="$_card_shard_list"
         local _subshell_counts_file="$_card_counts_file"
+        local _subshell_summary_file="$_card_summary_file"
 
         (
             set +euo pipefail
-            export SPYRE_DEVICES="${_subshell_card}"
+            export SPYRE_DEVICES="${_subshell_device_id}"
             # Isolate the Inductor / FxGraph cache per card so that concurrent
             # shutil.rmtree() calls from FxGraphCache.clear() in different card
             # subshells do not race on the same /tmp/torchinductor_*/fxgraph/
@@ -1941,7 +2086,7 @@ _run_parallel_across_cards() {
                 done <<< "${_file_to_ids[$_fidx]}"
 
                 echo "========================================================================"
-                echo "[torch_oot_device_tests_run] card ${_subshell_card} | SPYRE_DEVICES=${_subshell_card} | ${#_node_ids[@]} test(s)"
+                echo "[torch_oot_device_tests_run] card ${_subshell_card} | SPYRE_DEVICES=${_subshell_device_id} | ${#_node_ids[@]} test(s)"
                 if [[ "$run_file" != "$original_file" ]]; then
                     echo "[torch_oot_device_tests_run] Running (via OOT wrapper): $original_file"
                 else
@@ -2002,11 +2147,29 @@ _run_parallel_across_cards() {
                     echo "[torch_oot_device_tests_run] ERROR: pytest subshell exited abnormally for $original_file" >&2
                 fi
 
-                # Accumulate per-suite counts (multi-config only, clean runs).
-                if [[ ${#YAML_CONFIGS[@]} -ge 2 && -f "$_par_out_tmp" && $_exit -lt 128 ]]; then
-                    _p_suite_label="${_FILE_YAML_LABEL[$_fidx]:-unknown}"
+                # Track per-file results and collect failed test names.
+                _p_file_display="$(basename "$original_file")"
+                if [[ -f "$_par_out_tmp" && $_exit -lt 128 ]]; then
                     read -r _sp _sf _se _ss _sxf _sxp _st <<< "$(_parse_pytest_summary_line "$_par_out_tmp")"
-                    echo "${_p_suite_label} ${_sp:-0} ${_sf:-0} ${_se:-0} ${_ss:-0} ${_sxf:-0} ${_sxp:-0} ${_st:-0}" >> "$_subshell_counts_file"
+                    # Accumulate per-suite counts (multi-config).
+                    if [[ ${#YAML_CONFIGS[@]} -ge 2 ]]; then
+                        _p_suite_label="${_FILE_YAML_LABEL[$_fidx]:-unknown}"
+                        echo "${_p_suite_label} ${_sp:-0} ${_sf:-0} ${_se:-0} ${_ss:-0} ${_sxf:-0} ${_sxp:-0} ${_st:-0}" >> "$_subshell_counts_file"
+                    fi
+                    # Record per-file result for end-of-run summary.
+                    case $_exit in
+                        0) _pfstatus="PASS" ;;
+                        1) _pfstatus="FAIL" ;;
+                        5) _pfstatus="NOTEST" ;;
+                        *) _pfstatus="ERROR" ;;
+                    esac
+                    echo "FILE_RESULT ${_p_file_display} ${_pfstatus} ${_sp:-0} ${_sf:-0} ${_se:-0} ${_ss:-0} ${_sxf:-0} ${_sxp:-0} ${_st:-0}" >> "$_subshell_summary_file"
+                    # Collect failed test names.
+                    while IFS= read -r _pfn; do
+                        [[ -n "$_pfn" ]] && echo "FAILED_TEST ${_pfn}" >> "$_subshell_summary_file"
+                    done < <(_extract_failed_tests "$_par_out_tmp")
+                elif [[ $_exit -ge 128 ]]; then
+                    echo "FILE_RESULT ${_p_file_display} SIGNAL 0 0 0 0 0 0 0" >> "$_subshell_summary_file"
                 fi
                 rm -f "$_par_out_tmp"
 
@@ -2069,7 +2232,22 @@ _run_parallel_across_cards() {
 
     # -----------------------------------------------------------------------
     # Step 4: wait for all card subshells; collect exit codes and XML shards.
+    #
+    # Per-file results are aggregated across cards: a single test file may have
+    # its tests split round-robin across N cards, so each card writes its own
+    # FILE_RESULT entry.  The associative arrays below accumulate those slices
+    # and produce one consolidated row per file in the final summary.
     # -----------------------------------------------------------------------
+    local -A _par_agg_p=()
+    local -A _par_agg_f=()
+    local -A _par_agg_e=()
+    local -A _par_agg_s=()
+    local -A _par_agg_xf=()
+    local -A _par_agg_xp=()
+    local -A _par_agg_t=()
+    local -A _par_agg_status=()
+    local -a _par_agg_order=()
+
     echo "[torch_oot_device_tests_run] Waiting for all card jobs to finish..."
     for (( _k=0; _k<_n_cards; _k++ )); do
         wait "${_card_pids[$_k]}" || true
@@ -2111,7 +2289,66 @@ _run_parallel_across_cards() {
             rm -f "$_counts_file"
         fi
 
+        # Read per-file results and failed test names written by the card subshell.
+        # FILE_RESULT entries are accumulated into _par_agg_* rather than written
+        # directly to _FILE_SUMMARY_* so that slices from different cards for the
+        # same file are merged into one consolidated row.
+        local _summary_file="${_card_summary_files[$_k]}"
+        if [[ -f "$_summary_file" ]]; then
+            while IFS= read -r _sline; do
+                [[ -z "$_sline" ]] && continue
+                _stype="${_sline%% *}"
+                _srest="${_sline#* }"
+                if [[ "$_stype" == "FILE_RESULT" ]]; then
+                    read -r _slbl _sstatus _sp _sf _se _ss _sxf _sxp _st <<< "$_srest"
+                    _slbl="${_slbl:-unknown}"
+                    # First time we see this file: initialise aggregation slots.
+                    if [[ -z "${_par_agg_status[$_slbl]+set}" ]]; then
+                        _par_agg_order+=("$_slbl")
+                        _par_agg_p[$_slbl]=0
+                        _par_agg_f[$_slbl]=0
+                        _par_agg_e[$_slbl]=0
+                        _par_agg_s[$_slbl]=0
+                        _par_agg_xf[$_slbl]=0
+                        _par_agg_xp[$_slbl]=0
+                        _par_agg_t[$_slbl]="0"
+                        _par_agg_status[$_slbl]="NOTEST"
+                    fi
+                    # Sum counts across card slices.
+                    _par_agg_p[$_slbl]=$(( ${_par_agg_p[$_slbl]} + ${_sp:-0} ))
+                    _par_agg_f[$_slbl]=$(( ${_par_agg_f[$_slbl]} + ${_sf:-0} ))
+                    _par_agg_e[$_slbl]=$(( ${_par_agg_e[$_slbl]} + ${_se:-0} ))
+                    _par_agg_s[$_slbl]=$(( ${_par_agg_s[$_slbl]} + ${_ss:-0} ))
+                    _par_agg_xf[$_slbl]=$(( ${_par_agg_xf[$_slbl]} + ${_sxf:-0} ))
+                    _par_agg_xp[$_slbl]=$(( ${_par_agg_xp[$_slbl]} + ${_sxp:-0} ))
+                    _par_agg_t[$_slbl]=$(python3 -c "print('%.2f' % (${_par_agg_t[$_slbl]:-0} + ${_st:-0}))" 2>/dev/null || echo "${_par_agg_t[$_slbl]}")
+                    # Merge status: SIGNAL > FAIL > ERROR > PASS > NOTEST
+                    case "$_sstatus" in
+                        SIGNAL) _par_agg_status[$_slbl]="SIGNAL" ;;
+                        FAIL)   [[ "${_par_agg_status[$_slbl]}" != "SIGNAL" ]] && \
+                                    _par_agg_status[$_slbl]="FAIL" ;;
+                        ERROR)  [[ "${_par_agg_status[$_slbl]}" != "SIGNAL" && \
+                                    "${_par_agg_status[$_slbl]}" != "FAIL" ]] && \
+                                    _par_agg_status[$_slbl]="ERROR" ;;
+                        PASS)   [[ "${_par_agg_status[$_slbl]}" == "NOTEST" ]] && \
+                                    _par_agg_status[$_slbl]="PASS" ;;
+                    esac
+                elif [[ "$_stype" == "FAILED_TEST" ]]; then
+                    _ALL_FAILED_TESTS+=("$_srest")
+                fi
+            done < "$_summary_file"
+            rm -f "$_summary_file"
+        fi
+
         rm -f "${_card_id_files[$_k]}"
+    done
+
+    # Populate _FILE_SUMMARY_* from the aggregated per-file results (one row per
+    # unique file, counts summed across all card slices).
+    for _slbl in "${_par_agg_order[@]+"${_par_agg_order[@]}"}"; do
+        _FILE_SUMMARY_LABELS+=("$_slbl")
+        _FILE_SUMMARY_STATUS+=("${_par_agg_status[$_slbl]}")
+        _FILE_SUMMARY_COUNTS+=("${_par_agg_p[$_slbl]} ${_par_agg_f[$_slbl]} ${_par_agg_e[$_slbl]} ${_par_agg_s[$_slbl]} ${_par_agg_xf[$_slbl]} ${_par_agg_xp[$_slbl]} ${_par_agg_t[$_slbl]}")
     done
 }
 
@@ -2246,11 +2483,29 @@ for i in "${!RUN_FILES[@]}"; do
         echo "[torch_oot_device_tests_run] ERROR: pytest subshell exited abnormally (segfault or signal?) for $original_file" >&2
     fi
 
-    # Accumulate per-suite counts from pytest terminal output (multi-config only).
-    if [[ ${#YAML_CONFIGS[@]} -ge 2 && -f "$_OUT_TMP" && $_exit -lt 128 ]]; then
-        _suite_label="${_FILE_YAML_LABEL[$i]:-unknown}"
+    # Track per-file results and collect failed test names (always).
+    _file_display="$(basename "$original_file")"
+    if [[ -f "$_OUT_TMP" && $_exit -lt 128 ]]; then
         read -r _sp _sf _se _ss _sxf _sxp _st <<< "$(_parse_pytest_summary_line "$_OUT_TMP")"
-        _add_suite_counts "$_suite_label" "${_sp:-0}" "${_sf:-0}" "${_se:-0}" "${_ss:-0}" "${_sxf:-0}" "${_sxp:-0}" "${_st:-0}"
+        # Accumulate per-suite counts (multi-config).
+        if [[ ${#YAML_CONFIGS[@]} -ge 2 ]]; then
+            _suite_label="${_FILE_YAML_LABEL[$i]:-unknown}"
+            _add_suite_counts "$_suite_label" "${_sp:-0}" "${_sf:-0}" "${_se:-0}" "${_ss:-0}" "${_sxf:-0}" "${_sxp:-0}" "${_st:-0}"
+        fi
+        # Record per-file result for end-of-run summary.
+        case $_exit in
+            0) _fstatus="PASS" ;;
+            1) _fstatus="FAIL" ;;
+            5) _fstatus="NOTEST" ;;
+            *) _fstatus="ERROR" ;;
+        esac
+        _FILE_SUMMARY_LABELS+=("$_file_display")
+        _FILE_SUMMARY_STATUS+=("$_fstatus")
+        _FILE_SUMMARY_COUNTS+=("${_sp:-0} ${_sf:-0} ${_se:-0} ${_ss:-0} ${_sxf:-0} ${_sxp:-0} ${_st:-0}")
+        # Collect failed test names.
+        while IFS= read -r _fn; do
+            [[ -n "$_fn" ]] && _ALL_FAILED_TESTS+=("$_fn")
+        done < <(_extract_failed_tests "$_OUT_TMP")
     fi
     rm -f "$_OUT_TMP"
 
@@ -2401,6 +2656,58 @@ if [[ ${#YAML_CONFIGS[@]} -ge 2 ]]; then
             printf "  %-52s  %s\n" "$_lbl" "$_summary"
         done
     fi
+    echo "========================================================================"
+fi
+
+# ---------------------------------------------------------------------------
+# Per-file result summary — always printed.
+# ---------------------------------------------------------------------------
+echo ""
+echo "========================================================================"
+echo "[torch_oot_device_tests_run] Per-file result summary:"
+echo "========================================================================"
+if [[ ${#_FILE_SUMMARY_LABELS[@]} -eq 0 ]]; then
+    echo "  (no file results recorded)"
+else
+    for _fi in "${!_FILE_SUMMARY_LABELS[@]}"; do
+        _flbl="${_FILE_SUMMARY_LABELS[$_fi]}"
+        _fstat="${_FILE_SUMMARY_STATUS[$_fi]}"
+        read -r _fp _ff _fe _fs _fxf _fxp _ft <<< "${_FILE_SUMMARY_COUNTS[$_fi]}"
+        _fparts=()
+        [[ "${_fp:-0}"  -gt 0 ]] && _fparts+=("${_fp} passed")
+        [[ "${_ff:-0}"  -gt 0 ]] && _fparts+=("${_ff} failed")
+        [[ "${_fe:-0}"  -gt 0 ]] && _fparts+=("${_fe} error")
+        [[ "${_fs:-0}"  -gt 0 ]] && _fparts+=("${_fs} skipped")
+        [[ "${_fxf:-0}" -gt 0 ]] && _fparts+=("${_fxf} xfailed")
+        [[ "${_fxp:-0}" -gt 0 ]] && _fparts+=("${_fxp} xpassed")
+        if [[ ${#_fparts[@]} -eq 0 ]]; then
+            case "$_fstat" in
+                NOTEST) _fsummary="no tests collected" ;;
+                SIGNAL) _fsummary="signal/crash (see above)" ;;
+                *)      _fsummary="0 tests" ;;
+            esac
+        else
+            _fsummary="$(IFS=', '; echo "${_fparts[*]}")"
+            if [[ -n "${_ft:-}" && "$_ft" != "0" ]]; then
+                _fsummary="${_fsummary} in ${_ft}s"
+            fi
+        fi
+        printf "  %-8s  %-52s  %s\n" "$_fstat" "$_flbl" "$_fsummary"
+    done
+fi
+echo "========================================================================"
+
+# ---------------------------------------------------------------------------
+# Failed test names — printed when any failures were recorded.
+# ---------------------------------------------------------------------------
+if [[ ${#_ALL_FAILED_TESTS[@]} -gt 0 ]]; then
+    echo ""
+    echo "========================================================================"
+    echo "[torch_oot_device_tests_run] Failed tests (${#_ALL_FAILED_TESTS[@]}):"
+    echo "========================================================================"
+    for _failed in "${_ALL_FAILED_TESTS[@]}"; do
+        echo "  $_failed"
+    done
     echo "========================================================================"
 fi
 

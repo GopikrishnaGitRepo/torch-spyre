@@ -21,6 +21,7 @@ each call has its own fresh decorator instances. A one-time global patch
 would not affect these copies.
 """
 
+from functools import wraps
 from typing import Set, List, Optional
 import torch
 import regex as re
@@ -118,6 +119,34 @@ class _OOTCpuMovePatcher:
             setattr(self._cls, func_name, wrapped)
 
 
+class _OOTNoGradPatcher:
+    """Wraps an already-instantiated test method to run under torch.no_grad().
+
+    Spyre's custom ops (torch_spyre/_inductor/customops.py) never register an
+    autograd formula, and every eager op call is transparently routed through
+    torch.compile(backend="inductor") (torch_spyre/ops/eager.py). Since
+    nn.Module parameters default to requires_grad=True, AOTAutograd builds a
+    joint forward+backward graph at *compile* time even when the test never
+    calls .backward() -- compilation then fails as soon as a backward-less
+    custom op (e.g. spyre::silu) appears in that graph.
+
+    Upstream's ModuleInfo-based test_forward (test/test_modules.py) builds
+    modules with ordinary requires_grad=True parameters and never calls
+    backward(), so wrapping it in torch.no_grad() keeps compilation on the
+    inference-only path this backend actually supports without changing
+    upstream test semantics.
+    """
+
+    @staticmethod
+    def wrap(fn):
+        @wraps(fn)
+        def _no_grad_wrapper(self, *args, **kwargs):
+            with torch.no_grad():
+                return fn(self, *args, **kwargs)
+
+        return _no_grad_wrapper
+
+
 class _OOTNativeDeviceTypesPatcher:
     """Patches NATIVE_DEVICES in common_device_type to include 'privateuse1'.
 
@@ -132,7 +161,7 @@ class _OOTNativeDeviceTypesPatcher:
     global directly.
 
     NATIVE_DEVICES already includes torch._C._get_privateuse1_backend_name()
-    but TorchTestBase.device_type is reset to the literal string "privateuse1"
+    but OOTTestBase.device_type is reset to the literal string "privateuse1"
     in setUpClass when PYTORCH_TESTING_DEVICE_ONLY_FOR=privateuse1 is set.
     That means the runtime check sees "privateuse1" and misses the registered
      name entry.
@@ -217,7 +246,7 @@ class _OOTOnlyOnPatcher:
                 if isinstance(val.device_type, list):
                     if self._PRIVATEUSE1 not in val.device_type:
                         val.device_type.append(self._PRIVATEUSE1)
-                    # Also append "privateuse1" because TorchTestBase.device_type is
+                    # Also append "privateuse1" because OOTTestBase.device_type is
                     # reset to "privateuse1" in setUpClass (to preserve correct class
                     # naming for PYTORCH_TESTING_DEVICE_ONLY_FOR=privateuse1), so the
                     # @onlyOn check sees "privateuse1" at runtime, not the registered

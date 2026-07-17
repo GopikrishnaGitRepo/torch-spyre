@@ -12,13 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Tests for propagate_named_dims — the pass that annotates each op's output
-# with semantic named dim labels (B, H, Lq, etc.) by propagating them from
-# annotated graph inputs through the op graph.
+# Tests for propagate_named_dims and the dim_info mechanism.
 #
-# Each test compiles a small function, intercepts the pass via patching, and
-# asserts that the graph output buffer carries the expected named dims.
-# No coarse tiling hints are used — these tests cover propagation only.
+# These tests verify that named dim labels (B, H, Lq, etc.) are correctly
+# propagated. They do not exercise the Spyre backend — functions are compiled
+# and the pass is intercepted via patching before any backend codegen runs.
 
 import collections
 import math
@@ -111,7 +109,8 @@ def _run_and_capture(
     with (
         patch.object(_passes, "propagate_named_dims", capturing_propagate),
         patch.object(_passes, "assign_dim_hints", capturing_assign),
-        patch("torch_spyre.execution.kernel_runner.launch_kernel"),
+        patch("torch_spyre.execution.kernel_runner.prepare_kernel"),
+        patch("torch_spyre.execution.kernel_runner.launch_jobplan"),
         patch("torch_spyre.execution.async_compile.subprocess.run"),
     ):
         _compile_and_run(fn, args, DEVICE)
@@ -926,6 +925,49 @@ def test_permute_mul_equal_dims_distinct_names():
     )
 
 
+def test_reshape_split_untracked_dim_tolerated():
+    """Reshape that splits an _untracked_ intermediate dim is tolerated, not raised.
+
+    Mirrors a k/v projection reshaped into heads: an *unannotated* input produces
+    an intermediate whose dims carry only _untracked_ placeholder names (no
+    meaningful name to preserve).  A view then splits that dim into two loop
+    vars, hitting the len(loop_vars) > len(names) branch in
+    compute_input_named_dims.  Because the split name is only _untracked_, the
+    pass assigns fresh untracked names per loop var and keeps going instead of
+    aborting like test_reshape_1d_to_2d_exp (which splits a *real* named dim).
+
+    Contrast with test_reshape_1d_to_2d_exp: that splits the meaningful name "A"
+    and raises "reshape split a named dim"; here nothing meaningful is split, so
+    compilation succeeds and the output dims are all _untracked_.
+
+    x is left unannotated (no tensor_dims entry) so its consuming op is assigned
+    _untracked_ names; y anchors a valid named_dims declaration for the run.
+    """
+    _T, _Hh, _Dd = 8, 4, 64  # HD = 256 splits into H=4, D=64
+    x = torch.randn(_T, _Hh * _Dd, dtype=torch.float16, device=DEVICE) * 0.1
+    y = torch.randn(_T, _Hh, _Dd, dtype=torch.float16, device=DEVICE) * 0.1
+
+    def fn(x, y):
+        # x.exp() forces an intermediate ComputedBuffer with _untracked_ names,
+        # then the view splits its untracked [HD] dim into [H, D].
+        t = x.exp().view(_T, _Hh, _Dd)
+        return t + y
+
+    # The assertion is simply that compilation does not raise: without the
+    # _untracked_ tolerance branch, the split of x.exp()'s untracked dim would
+    # hit "reshape split a named dim" and abort.  We deliberately do not pin the
+    # output op's propagated_dims -- the final op reads annotated y, so its names
+    # come from y, not from the untracked split path under test; asserting them
+    # would test the wrong op.  Reaching this line means the branch tolerated
+    # the split.
+    _run_and_capture(
+        fn,
+        [x, y],
+        named_dims={"T": _T, "H": _Hh, "D": _Dd},
+        tensor_dims={y: ["T", "H", "D"]},
+    )
+
+
 def test_reshape_1d_to_2d_exp():
     """1-D tensor [4096] annotated ['A'] -> reshape(64,64) raises Unsupported.
 
@@ -1045,6 +1087,7 @@ def test_broadcast_expand_middle_dim():
 # -------- Indirect-access (gather) tests --------
 
 _GM, _GN, _GP = 128, 256, 32
+_GQ = 192
 _GA, _GB, _GC = 64, 8, 64
 
 
@@ -1116,4 +1159,22 @@ def test_index_select_2d():
         named_dims={"M": _GM, "N": _GN, "P": _GP},
         tensor_dims={x: ["M", "N"], i: ["P"]},
         expected_propagated_dims=["P", "N"],
+    )
+
+
+def test_gather_2d_index():
+    """x[i]: x[M,N] gathered by 2-D index i[P,Q]. Output is [P,Q,N]; the
+    gathered M dim has a 2-D indirect index (0 loop vars); inner N propagates."""
+    x = torch.randn(_GM, _GN, dtype=torch.float16, device=DEVICE)
+    i = torch.randint(0, _GM, (_GP, _GQ), dtype=torch.int32, device=DEVICE)
+
+    def fn(x, i):
+        return x[i]
+
+    _run_and_capture(
+        fn,
+        [x, i],
+        named_dims={"M": _GM, "N": _GN, "P": _GP, "Q": _GQ},
+        tensor_dims={x: ["M", "N"], i: ["P", "Q"]},
+        expected_propagated_dims=["P", "Q", "N"],
     )

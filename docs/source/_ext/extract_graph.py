@@ -108,7 +108,10 @@ def extract_decompositions(filepath):
             continue
         for dec in node.decorator_list:
             dec_name = _get_decorator_name(dec)
-            if dec_name and "register_spyre_decomposition" in dec_name:
+            if dec_name and (
+                "register_spyre_decomposition" in dec_name
+                or "register_decomposition" in dec_name
+            ):
                 if isinstance(dec, ast.Call) and dec.args:
                     ops = _extract_list_ops(dec.args[0])
                     decomp_id = f"decomp::{node.name}"
@@ -455,6 +458,35 @@ def extract_passes(filepath):
                                             "relationship": "contains_pass",
                                         }
                                     )
+            if isinstance(child, ast.Assign):
+                for target in child.targets:
+                    if (
+                        isinstance(target, ast.Attribute)
+                        and isinstance(target.value, ast.Name)
+                        and target.value.id == "self"
+                        and target.attr == "passes"
+                        and isinstance(child.value, ast.List)
+                    ):
+                        for elt in child.value.elts:
+                            name = _resolve_attr(elt)
+                            if name:
+                                fn_id = f"passfn::{name}"
+                                nodes.append(
+                                    {
+                                        "id": fn_id,
+                                        "label": name,
+                                        "type": "pass_function",
+                                        "source_file": rel_path,
+                                        "line": getattr(elt, "lineno", node.lineno),
+                                    }
+                                )
+                                edges.append(
+                                    {
+                                        "source": group_id,
+                                        "target": fn_id,
+                                        "relationship": "contains_pass",
+                                    }
+                                )
 
     return nodes, edges
 
@@ -540,7 +572,11 @@ def extract_config(filepath):
         if not isinstance(node, ast.Call):
             continue
         func_name = _resolve_attr(node.func)
-        if func_name not in ("os.environ.get", "os.getenv"):
+        if func_name not in (
+            "os.environ.get",
+            "os.getenv",
+            "os.environ.setdefault",
+        ):
             continue
         if not node.args:
             continue
@@ -744,6 +780,40 @@ def _get_git_sha(repo_root):
         return "unknown"
 
 
+def _run_file_extractor(extractor, filepath, repo_root):
+    """Run a single-file extractor and normalize the path it was handed.
+
+    Extractors read their input via the path they are handed and echo it
+    back as each node's ``source_file``; ``extract_config`` also bakes that
+    path into the config module node id (and the endpoints of its
+    ``reads_env`` edges). We pass the absolute path so the read resolves
+    regardless of the current working directory (the docs build runs from
+    docs/source on ReadTheDocs, not the repo root), then rewrite the absolute
+    path back to one relative to ``repo_root`` wherever it appears so node
+    ids and ``source_file`` stay stable across build environments.
+    """
+    abs_path = str(filepath)
+    rel_path = str(Path(filepath).relative_to(repo_root))
+
+    nodes, edges = extractor(abs_path)
+
+    id_remap = {}
+    for node in nodes:
+        if node.get("source_file"):
+            node["source_file"] = node["source_file"].replace(abs_path, rel_path)
+        if abs_path in node["id"]:
+            new_id = node["id"].replace(abs_path, rel_path)
+            id_remap[node["id"]] = new_id
+            node["id"] = new_id
+
+    for edge in edges:
+        for endpoint in ("source", "target"):
+            if edge.get(endpoint) in id_remap:
+                edge[endpoint] = id_remap[edge[endpoint]]
+
+    return nodes, edges
+
+
 def build_graph(torch_spyre_root):
     """Run all extractors and assemble the deduplicated graph."""
     root = Path(torch_spyre_root)
@@ -764,8 +834,7 @@ def build_graph(torch_spyre_root):
 
     for extractor, filepath in op_extractors:
         if filepath.exists():
-            rel = str(filepath.relative_to(repo_root))
-            n, e = extractor(rel)
+            n, e = _run_file_extractor(extractor, filepath, repo_root)
             all_nodes.extend(n)
             all_edges.extend(e)
 
@@ -787,8 +856,7 @@ def build_graph(torch_spyre_root):
 
     for filepath in class_files:
         if filepath.exists():
-            rel = str(filepath.relative_to(repo_root))
-            n, e = extract_classes(rel)
+            n, e = _run_file_extractor(extract_classes, filepath, repo_root)
             all_nodes.extend(n)
             all_edges.extend(e)
 
@@ -802,18 +870,21 @@ def build_graph(torch_spyre_root):
 
     for filepath in codegen_files:
         if filepath.exists():
-            rel = str(filepath.relative_to(repo_root))
-            n, e = extract_codegen_structures(rel)
+            n, e = _run_file_extractor(extract_codegen_structures, filepath, repo_root)
             all_nodes.extend(n)
             all_edges.extend(e)
 
     # --- Configuration / environment variables ---
     config_path = root / "_inductor" / "config.py"
     if config_path.exists():
-        rel = str(config_path.relative_to(repo_root))
-        n, e = extract_config(rel)
+        n, e = _run_file_extractor(extract_config, config_path, repo_root)
         all_nodes.extend(n)
         all_edges.extend(e)
+    for extra_config in [root / "__init__.py", root / "logging_config.py"]:
+        if extra_config.exists():
+            n, e = _run_file_extractor(extract_config, extra_config, repo_root)
+            all_nodes.extend(n)
+            all_edges.extend(e)
 
     # --- Module dependency graph ---
     n, e = extract_modules(str(root), repo_root)
@@ -848,7 +919,12 @@ def build_graph(torch_spyre_root):
     graph = {
         "metadata": {
             "source_commit": _get_git_sha(repo_root),
-            "torch_spyre_root": str(root),
+            "torch_spyre_root": str(root.relative_to(repo_root)),
+            # Canonical repo used to build "view source" links in the explorer.
+            # The JS pins links to source_commit when available and falls back
+            # to the default branch otherwise.
+            "repo_url": "https://github.com/torch-spyre/torch-spyre",
+            "default_branch": "main",
         },
         "nodes": list(seen.values()),
         "edges": valid_edges,

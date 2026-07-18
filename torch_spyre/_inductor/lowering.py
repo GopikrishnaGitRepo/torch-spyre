@@ -16,6 +16,7 @@
 from contextlib import contextmanager
 from warnings import warn
 
+import sympy
 import torch
 
 from torch._inductor.ir import Reduction, Pointwise, StorageBox
@@ -1105,6 +1106,33 @@ def lower_constant_pad_nd(input, pad, value=0, align_to_stick=False):
     return output
 
 
+def _lacks_dense_dim(x) -> bool:
+    """True if every dim of size>1 in x's host layout has stride != 1.
+
+    Such a layout (e.g. from `tensor[..., ::2]`) leaves no dimension the
+    Spyre stick codegen can address directly: whichever dim layout
+    propagation picks as the stick dimension, its stick coordinate reduces
+    to ``coeff*Mod(var, N)`` for coeff > 1, which the backend cannot emit
+    (see pass_utils._stick_expr_stride). Conservatively returns False
+    (i.e. "let the normal path try") when size/stride aren't concrete, or
+    when x has no layout yet (e.g. an unrealized elementwise IR node,
+    which is dense by construction).
+    """
+    try:
+        size = x.get_size()
+        stride = x.get_stride()
+    except (NotImplementedError, AttributeError):
+        return False
+    dims = [
+        (s, st)
+        for s, st in zip(size, stride)
+        if isinstance(s, (int, sympy.Integer)) and int(s) > 1
+    ]
+    if not dims or any(not isinstance(st, (int, sympy.Integer)) for _, st in dims):
+        return False
+    return not any(int(st) == 1 for _, st in dims)
+
+
 @register_spyre_lowering(
     torch.ops.prims.convert_element_type.default,
     type_promotion_kind=None,
@@ -1117,9 +1145,10 @@ def to_dtype(x, dst_dtype):
     if src_dtype == dst_dtype:
         return lowering.clone(x)
 
-    # Check if conversion is supported by backend
-    if DtypeOpTable.get_operator(src_dtype, dst_dtype) is None:
-        # Unsupported conversion - fall back to CPU
+    # Fall back to CPU when the backend has no direct op for this dtype
+    # pair, or when x's memory layout (e.g. a strided slice like
+    # `tensor[..., ::2]`) has no dimension the stick codegen can address.
+    if DtypeOpTable.get_operator(src_dtype, dst_dtype) is None or _lacks_dense_dim(x):
         op = torch.ops.spyre.to_dtype_cpu.default
         return eager_fallback(op, x, dst_dtype)
 

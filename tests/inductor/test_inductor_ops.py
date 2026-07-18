@@ -288,6 +288,20 @@ TO_DTYPE_OP_PARAMS_SETS = {
     if src not in (torch.bool, torch.float8_e4m3fn) and dst != torch.bool
 }
 
+# Regression: tensor[..., ::2].to(dtype) used to crash Inductor codegen with a
+# raw "Unexpected stick expression 2*(Mod(d1, 32))" error, because the strided
+# slice leaves no dimension the stick codegen can address. This should now
+# transparently fall back to CPU (see lowering._lacks_dense_dim) and produce
+# correct results rather than failing to compile.
+TO_DTYPE_OP_STRIDED_PARAMS_SETS = {
+    f"strided_{_dtype_name(src)}_to_{_dtype_name(dst)}": (
+        cached_randn((4, 128), dtype=src)[:, ::2],
+        dst,
+    )
+    for src, dst in DtypeOpTable.get_dtype_pairs()
+    if src not in (torch.bool, torch.float8_e4m3fn) and dst != torch.bool
+}
+
 
 _DTYPE_OP_ALL_OPS_FAIL_SHAPES = {(4, 68), (68,)}
 
@@ -4308,6 +4322,9 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             "param_sets": TO_DTYPE_OP_PARAMS_SETS,
             "expect_fail": TO_DTYPE_OP_EXPECT_FAIL,
         },
+        ("test_to_dtype_strided", "test_to_dtype_cpu"): {
+            "param_sets": TO_DTYPE_OP_STRIDED_PARAMS_SETS,
+        },
         ("test_round_trip_to_dtype", "test_round_trip_to_dtype_cpu"): {
             "ops_dict": {"add": torch.add},
             "param_sets": TO_DTYPE_OP_ROUND_TRIP_PARAMS_SETS,
@@ -6105,6 +6122,41 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             cpu_compile=False,
             run_eager=False,
         )
+
+    def test_strided_slice_to_dtype_round_trip_cpu(self):
+        """Regression: tensor[:, ::2].to(fp32).to(fp16) used to crash with a
+        raw "Unexpected stick expression 2*(Mod(d0, 64))" error. The first
+        conversion (strided input) falls back to CPU once and produces a
+        dense result; the second conversion then compiles natively on Spyre
+        rather than falling back again.
+        """
+
+        def fn(x):
+            return x[:, ::2].to(torch.float32).to(torch.float16)
+
+        x = cached_randn((4, 128), dtype=torch.float16)
+        self.compare_with_cpu(fn, x, cpu_compile=False, run_eager=False)
+
+    def test_strided_slice_contiguous_cpu(self):
+        """Regression: .contiguous() on a strided slice hit the same
+        unrepresentable-stick crash in a second site (_clone_layout)."""
+
+        def fn(x):
+            return x[:, ::2].contiguous()
+
+        x = cached_randn((4, 128), dtype=torch.float16)
+        self.compare_with_cpu(fn, x, cpu_compile=False, run_eager=False)
+
+    def test_strided_slice_to_dtype_identity_cpu(self):
+        """Regression: tensor[:, ::2].to(same_dtype) routes through clone()
+        (the to_dtype identity branch) and hit the same crash as
+        test_strided_slice_contiguous_cpu."""
+
+        def fn(x):
+            return x[:, ::2].to(torch.float16)
+
+        x = cached_randn((4, 128), dtype=torch.float16)
+        self.compare_with_cpu(fn, x, cpu_compile=False, run_eager=False)
 
     def test_round_trip_to_dtype_cpu(self, op, x, dst_dtype):
         def fn(op, x, dst_dtype):

@@ -498,6 +498,13 @@ def _clone_layout(
       - Insert restickify before clone to swap stick with non-stick dimension
       - Clone op also becomes restickify op to swap dimensions back
       - The second restickify handles the tensor with offset
+
+    Case 3: Input has a stick expression the backend cannot represent at all
+    (e.g. ``coeff*Mod(var, N)`` from a strided slice like ``tensor[..., ::2]``)
+      - Treated like Case 1: no restickify insertion needed. A clone always
+        materializes a fresh dense row-major buffer regardless of the
+        input's stick layout, so an unrepresentable *input* stick doesn't
+        block it.
     """
     data = op.data
 
@@ -508,8 +515,7 @@ def _clone_layout(
 
     in_dep = args[0].dep
     in_stl = next(iter(args[0].layouts))
-    in_device_coords = device_coordinates(in_stl, in_dep, None)
-    stick_expr = in_device_coords[-1]
+    in_device_coords = try_device_coordinates(in_stl, in_dep, None)
     stick_size = get_elem_in_stick(output.dtype)
 
     c_size = [concretize_expr(s) for s in output.size]
@@ -518,11 +524,15 @@ def _clone_layout(
         c_size, c_stride, output.dtype, list(range(len(output.size)))
     )
 
-    if is_stick_expr_offset_free(stick_expr, stick_size):
-        # Case 1: No restickify insertion needed.
+    if in_device_coords is None or is_stick_expr_offset_free(
+        in_device_coords[-1], stick_size
+    ):
+        # Case 1 or Case 3: No restickify insertion needed.
         # Use AnyInNode to produce the fixed output layout.
         op.restick_cost_fn = AnyInNode.from_args()
         return [out_stl]
+
+    stick_expr = in_device_coords[-1]
 
     # Case 2: Find alternative dimension to swap with the current stick dimension.
     # TODO: FixedInOutNode only supports a single required STL, so we select

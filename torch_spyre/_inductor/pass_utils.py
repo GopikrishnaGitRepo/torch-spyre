@@ -691,16 +691,51 @@ def _is_stick_expr_with_offset(stick_expr: sympy.Expr, elems_per_stick: int) -> 
     )
 
 
+def _stick_expr_stride(stick_expr: sympy.Expr) -> sympy.Expr | None:
+    """Return the non-unit coefficient if stick_expr is a strided-access
+    pattern: ``coeff * Mod(var, N)`` or ``coeff * var``, optionally with a
+    constant additive offset. Returns None if stick_expr isn't this shape.
+
+    This arises from indexing the stick dimension with a step > 1 (e.g.
+    ``tensor[..., ::2]``): the resulting elements are not contiguous within a
+    stick, which the backend cannot address directly.
+    """
+    free_args = [a for a in sympy.Add.make_args(stick_expr) if a.free_symbols]
+    if len(free_args) != 1 or not isinstance(free_args[0], sympy.Mul):
+        return None
+    term = free_args[0]
+    coeff_parts = [a for a in term.args if not a.free_symbols]
+    var_parts = [a for a in term.args if a.free_symbols]
+    if len(var_parts) != 1:
+        return None
+    var_part = var_parts[0]
+    is_mod = (
+        isinstance(var_part, sympy.Mod) and len(var_part.args[0].free_symbols) == 1
+    )
+    if not (is_mod or var_part.is_symbol):
+        return None
+    coeff = sympy.Mul(*coeff_parts) if coeff_parts else sympy.S.One
+    return None if coeff == 1 else coeff
+
+
 def _check_stick_expr_supported(stick_expr: sympy.Expr, elems_per_stick: int) -> None:
     """Raise Unsupported for stick expressions may be valid but are not yet supported."""
     offset_free = is_stick_expr_offset_free(stick_expr, elems_per_stick)
     has_offset = _is_stick_expr_with_offset(stick_expr, elems_per_stick)
-    if not (offset_free or has_offset):
+    if offset_free or has_offset:
+        return
+    stride = _stick_expr_stride(stick_expr)
+    if stride is not None:
         raise Unsupported(
-            f"Unexpected stick expression {stick_expr!r}: expected "
-            f"Mod(var, {elems_per_stick}), a bare variable, 0, or any of those "
-            f"with a constant offset"
+            f"strided access (step={stride}) along the tensor's innermost "
+            f"dimension is not supported (e.g. from `tensor[..., ::{stride}]`); "
+            f"call .contiguous() on the tensor before this operation"
         )
+    raise Unsupported(
+        f"Unexpected stick expression {stick_expr!r}: expected "
+        f"Mod(var, {elems_per_stick}), a bare variable, 0, or any of those "
+        f"with a constant offset"
+    )
 
 
 def device_coordinates(

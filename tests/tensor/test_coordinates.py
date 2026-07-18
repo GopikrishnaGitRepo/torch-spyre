@@ -22,7 +22,10 @@ from torch_spyre._inductor.errors import Unsupported
 from torch_spyre._inductor.pass_utils import (
     device_coordinates,
     try_device_coordinates,
+    _check_stick_expr_supported,
+    _stick_expr_stride,
 )
+from torch_spyre._inductor.lowering import _lacks_dense_dim
 from torch_spyre._inductor.propagate_layouts import (
     PropArg,
     _check_supported_input_sticks,
@@ -212,6 +215,19 @@ class TestCoordinates(TestCase):
         )
         self.assertEqual(cx, [p1, p2 // 64 + 2, p0, p2 % 64])
 
+        # tensor[:, ::2] on a [4, 128] fp16 tensor:
+        # host index into the unsliced [4, 128] storage is 128*p0 + 2*p1 for
+        # output loop vars p0 (size 4), p1 (size 64). The stride-2 step
+        # produces a stick coordinate the backend cannot address directly:
+        # 2*(Mod(p1, 32)) instead of a bare Mod(var, 64).
+        cx = compute_coordinates(
+            [4, 2, 64],
+            [128, 64, 1],
+            {p0: 4, p1: 64},
+            128 * p0 + 2 * p1,
+        )
+        self.assertEqual(cx, [p0, p1 // 32, 2 * sympy.Mod(p1, 32)])
+
 
 class TestUnrepresentableStickCandidates(TestCase):
     """Cover the skip-unrepresentable-candidate behavior added for the
@@ -269,6 +285,104 @@ class TestUnrepresentableStickCandidates(TestCase):
         dep, bad, _ = self._traced_scenario()
         arg = PropArg(dep, None, [bad])
         _check_supported_input_sticks([arg], "batchmatmul")  # must not raise
+
+
+class TestStridedStickExpr(TestCase):
+    """Regression coverage for the ``tensor[..., ::2]`` bug: a strided access
+    into the stick dimension previously surfaced a raw, meaningless sympy
+    expression (e.g. ``2*(Mod(d1, 32))``) instead of an actionable error.
+    """
+
+    def test_stick_expr_stride_detects_strided_mod(self):
+        d0 = sympy.Symbol("d0", integer=True, nonnegative=True)
+        self.assertEqual(_stick_expr_stride(2 * sympy.Mod(d0, 32)), 2)
+        # with a constant offset
+        self.assertEqual(_stick_expr_stride(2 * sympy.Mod(d0, 32) + 5), 2)
+        # bare strided variable (no Mod present)
+        self.assertEqual(_stick_expr_stride(3 * d0), 3)
+
+    def test_stick_expr_stride_ignores_supported_and_unrelated_exprs(self):
+        d0 = sympy.Symbol("d0", integer=True, nonnegative=True)
+        # supported shapes: not strided, so no coefficient to report
+        self.assertIsNone(_stick_expr_stride(sympy.Mod(d0, 64)))
+        self.assertIsNone(_stick_expr_stride(d0))
+        self.assertIsNone(_stick_expr_stride(sympy.S.Zero))
+        # unrelated unsupported shape (cross-stick floor division)
+        self.assertIsNone(_stick_expr_stride(sympy.floor(d0 / 128)))
+
+    def test_check_stick_expr_supported_raises_actionable_message(self):
+        d0 = sympy.Symbol("d0", integer=True, nonnegative=True)
+        with self.assertRaisesRegex(Unsupported, r"contiguous"):
+            _check_stick_expr_supported(2 * sympy.Mod(d0, 32), 64)
+
+    def test_check_stick_expr_supported_still_raises_generic_message(self):
+        # A stick expression that is unsupported for an unrelated reason
+        # (cross-stick floor division) keeps the original generic message,
+        # not the strided-access one.
+        d0 = sympy.Symbol("d0", integer=True, nonnegative=True)
+        with self.assertRaisesRegex(Unsupported, r"Unexpected stick expression"):
+            _check_stick_expr_supported(sympy.floor(d0 / 128), 64)
+
+    def test_device_coordinates_raises_actionable_message_for_strided_slice(self):
+        # tensor[:, ::2] on a [4, 128] fp16 tensor, modeled as a device
+        # layout of [4 rows, 2 sticks/row, 64 elems/stick].
+        dev = SpyreTensorLayout([1, 1], torch.float16).device_dtype
+        p0, p1 = sympy.symbols("p0 p1", integer=True, nonnegative=True)
+        dep = MemoryDep("buf", 128 * p0 + 2 * p1, (p0, p1), (4, 64))
+        stl = SpyreTensorLayout([4, 2, 64], [128, 64, 1], dev)
+        with self.assertRaisesRegex(Unsupported, r"contiguous"):
+            device_coordinates(stl, dep, None)
+        self.assertIsNone(try_device_coordinates(stl, dep, None))
+
+
+class _FakeLayoutNode:
+    """Minimal stand-in for a TensorBox, exposing only what
+    lowering._lacks_dense_dim reads."""
+
+    def __init__(self, size, stride):
+        self._size = size
+        self._stride = stride
+
+    def get_size(self):
+        return self._size
+
+    def get_stride(self):
+        return self._stride
+
+
+class TestLacksDenseDim(TestCase):
+    """Regression coverage for the CPU-fallback trigger added to
+    lowering.to_dtype: a strided slice like ``tensor[..., ::2]`` leaves no
+    dimension the stick codegen can address, so ``to_dtype`` must route it
+    to the CPU fallback instead of compiling it directly (which used to
+    crash with a raw ``Unexpected stick expression`` error).
+    """
+
+    def test_strided_slice_lacks_dense_dim(self):
+        # tensor[:, ::2] on a [4, 128] tensor: shape (4, 64), stride (128, 2)
+        self.assertTrue(_lacks_dense_dim(_FakeLayoutNode([4, 64], [128, 2])))
+
+    def test_double_strided_lacks_dense_dim(self):
+        # tensor[::2, ::2] on a [4, 128] tensor: shape (2, 64), stride (256, 2)
+        self.assertTrue(_lacks_dense_dim(_FakeLayoutNode([2, 64], [256, 2])))
+
+    def test_transpose_has_dense_dim(self):
+        # tensor.transpose(0, 1) on [4, 128]: shape (128, 4), stride (1, 128)
+        self.assertFalse(_lacks_dense_dim(_FakeLayoutNode([128, 4], [1, 128])))
+
+    def test_offset_slice_has_dense_dim(self):
+        # tensor[:, 1:] on [4, 128]: shape (4, 127), stride (128, 1)
+        self.assertFalse(_lacks_dense_dim(_FakeLayoutNode([4, 127], [128, 1])))
+
+    def test_outer_strided_slice_has_dense_dim(self):
+        # tensor[::2, :] on [4, 128]: shape (2, 128), stride (256, 1)
+        self.assertFalse(_lacks_dense_dim(_FakeLayoutNode([2, 128], [256, 1])))
+
+    def test_contiguous_has_dense_dim(self):
+        self.assertFalse(_lacks_dense_dim(_FakeLayoutNode([4, 128], [128, 1])))
+
+    def test_scalar_has_no_dims_is_safe(self):
+        self.assertFalse(_lacks_dense_dim(_FakeLayoutNode([], [])))
 
 
 if __name__ == "__main__":

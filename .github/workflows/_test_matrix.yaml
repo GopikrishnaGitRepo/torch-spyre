@@ -258,15 +258,24 @@ jobs:
       matrix: ${{ fromJSON(needs.generate_matrix.outputs.matrix) }}
 
     steps:
-      # Composite actions: on the prebaked path the baked dir already has
-      # .github/actions (full source is baked), so this checkout is only needed
-      # on the normal path.
+      # Composite actions: NORMAL path sparse-checks-out .github/actions into the
+      # workspace. PREBAKED path symlinks the baked .github into the workspace
+      # instead — `uses: ./.github/actions/*` resolves against $GITHUB_WORKSPACE
+      # (never the shell cwd or an arbitrary baked dir), so without this the
+      # baked-but-unlinked actions can't be found ("did you forget to run
+      # actions/checkout"). The symlink runs the EXACT baked harness — no fetch,
+      # preserving the prebaked provenance guarantee — and lives in the runner's
+      # disposable workspace, so the baked tree is only referenced, never mutated.
       - name: Checkout composite actions
         if: ${{ !inputs.prebaked_image }}
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           sparse-checkout: .github/actions
           sparse-checkout-cone-mode: false
+
+      - name: Expose baked composite actions in the workspace
+        if: ${{ inputs.prebaked_image }}
+        run: ln -sfn "${PREBAKED_TORCH_SPYRE_DIR}/.github" "${GITHUB_WORKSPACE}/.github"
 
       # Product source: NORMAL path checks out the PR ref. PREBAKED path uses the
       # baked /home/senuser/torch-spyre (source + editable venv already in image)
@@ -379,12 +388,19 @@ jobs:
             config: distributed_tests/test_allgather.yaml
 
     steps:
+      # See the `test` job above: prebaked path symlinks the baked .github into
+      # $GITHUB_WORKSPACE so `uses: ./.github/actions/*` resolves to the baked
+      # harness (no fetch); normal path sparse-checks-out .github/actions.
       - name: Checkout composite actions
         if: ${{ !inputs.prebaked_image }}
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           sparse-checkout: .github/actions
           sparse-checkout-cone-mode: false
+
+      - name: Expose baked composite actions in the workspace
+        if: ${{ inputs.prebaked_image }}
+        run: ln -sfn "${PREBAKED_TORCH_SPYRE_DIR}/.github" "${GITHUB_WORKSPACE}/.github"
 
       - if: ${{ !inputs.prebaked_image }}
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2

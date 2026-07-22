@@ -415,6 +415,71 @@ may include at most one reduction variable. If more than one reduction
 variable would have to be split to satisfy the 255.996 MiB span limit, the
 compiler raises an error.
 
+## Symbolic (dynamic) dimensions
+
+A dimension can be **symbolic** rather than a fixed integer: the user calls
+`torch._dynamo.mark_dynamic(tensor, dim, min=..., max=...)`, which makes
+Dynamo trace that dim as a SymPy symbol with a finite upper bound recorded in
+`ShapeEnv`. The planner has to pick one split count that stays valid for
+*every* concrete value the symbol can take at runtime, not just the value
+seen when the graph was traced.
+
+`_collect_symbol_metadata` (in `work_division.py`) opts a dim into this path
+only when Dynamo recorded a finite `max` for it — an auto-promoted symbol
+with no finite bound (e.g. a Python-loop-varying int Dynamo widens on
+retrace) falls through to the ordinary concrete path instead. For each
+opted-in symbol it records a `(max_size, granularity)` pair:
+
+- **`max_size`** is the ShapeEnv upper bound — the worst-case runtime size
+  the compiled plan must remain legal against. Anywhere the planner would
+  otherwise use a dim's concrete size (span checks, size-ordering for
+  priority), a symbolic dim substitutes `max_size`.
+- **`granularity`** is the largest value that (a) divides `max_size` and
+  (b) is itself divisible by every value the runtime might actually pass, so
+  that `n | granularity ⇒ n | R` for every admissible runtime size `R`.
+  Anywhere the planner would otherwise pick a split from a dim's concrete
+  size's divisors (`core_split`, `must_split_vars`'s Cartesian search), a
+  symbolic dim substitutes `granularity` — this is what guarantees the
+  chosen split divides evenly no matter which concrete size shows up at
+  runtime.
+
+This is a per-dimension substitution, not a separate algorithm: every
+function in Passes 1 and 3 (`_effective_size`, `_valid_divisor_basis`,
+`core_split`, `_most_splittable_dim`, `must_split_vars`,
+`prioritize_dimensions`, `multi_dim_iteration_space_split`) dispatches on
+"is this specific dim in `symbol_meta`", not on the op's kind. Pass 2 (the
+matmul cost model) does not thread `symbol_meta` through at all today, so a
+symbolic dim on a `batchmatmul`/`bmm` falls back to a size hint rather than
+`max_size`/`granularity` — out of scope for the reduction op family this
+section otherwise covers.
+
+### Symbolic batch dims through reductions
+
+Because the dispatch above never inspects the op's `reduction_type`, a
+symbolic dim composes with the output/reduction split from
+[Reductions and reduction dimensions](#reductions-and-reduction-dimensions)
+exactly like a concrete one does: **a symbolic dim is an output dim, never a
+reduction dim, purely because `prioritize_dimensions` decides that
+partition by whether the dim's symbol appears in the *output* tensor's
+device coordinates** — symbolic-ness never enters that decision. A reduced
+dim, by definition, does not appear in the output's coordinates, so it can
+never be the dim that carries `mark_dynamic`'s symbol in the first place
+(the reduction axis itself being symbolic is a separate, not-yet-supported
+case — see Limitations).
+
+The practical consequence for `mean`, `exx2`, `prod`, and the
+`layer_norm`/`rms_norm` building blocks built from them: a symbolic batch
+dim always lands in `prioritize_dimensions`' `output_dims` list, and
+`multi_dim_iteration_space_split` always exhausts `output_dims` (Pass 3's
+step 2) before it ever looks at `reduction_dims` (step 3). So the symbolic
+batch dim is always split first, using its `granularity`; the (concrete)
+reduction dim only receives a split out of whatever cores are left over —
+same ordering, same core-budget accounting as the fully-concrete case,
+just with one dim's divisor basis swapped from its size to its granularity.
+`topkvalue`/`topkindex` reductions never reach this split at all: they hit
+`enumerate_work_division_candidates`'s single-core short-circuit for
+`TOPK_OPS` unconditionally, before any symbolic/concrete dispatch runs.
+
 ## Worked example: large matmul on 32 cores
 
 Take a single matmul with `A: [8192, 32768]`, `W: [32768, 4096]`,
@@ -592,6 +657,13 @@ annotations and use the automatic work-distribution planner.
 - Padding is approximated rather than retrieved from the layout (FIXME
   in `adjust_it_space_for_sticks`). Improved padding handling is being
   added in [#2359](https://github.com/torch-spyre/torch-spyre/pull/2359).
+- A symbolic **reduction axis** (as opposed to a symbolic output/batch dim)
+  is not supported. `adjust_it_space_for_sticks` unconditionally rejects a
+  symbolic stick dim, and a reduction op's stick dim is frequently the
+  reduction axis itself (e.g. `mean(dim=-1)`).
+- Pass 2 (the matmul cost model) does not thread `symbol_meta` through, so
+  a symbolic dim on `batchmatmul`/`bmm` is concretized via a size hint
+  rather than treated as bounded by `(max_size, granularity)`.
 
 **Potential future enhancements:**
 

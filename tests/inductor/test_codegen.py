@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import math
 import warnings
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -39,6 +40,8 @@ from torch_spyre._inductor.work_division import (
     _effective_size,
     _valid_divisor_basis,
     adjust_it_space_for_sticks,
+    multi_dim_iteration_space_split,
+    prioritize_dimensions,
 )
 
 
@@ -104,6 +107,77 @@ class TestSpyreConfig(InductorTestCase):
         FileCheck().check("sdsc_fused_add").check(", 32)").check(", 1)").run(
             source_codes[0]
         )
+
+    # ------------------------------------------------------------------
+    # Compiled-path symbolic-batch tests for reduction ops (#3062/#3063).
+    #
+    # These require the built torch_spyre._C extension and a real Spyre
+    # target (or whatever backend `torch.compile` falls back to for codegen
+    # inspection) -- this sandbox has neither, so the exact FileCheck
+    # literals below (kernel name, fused-op naming) are inferred from the
+    # pointwise precedent above and from reading wrapper.py's naming
+    # convention, not verified by running them. Run these first in isolation
+    # (`-k test_symbolic_batch_dim_reduction`) and adjust the literals if the
+    # real kernel names differ once compiled on hardware.
+    # ------------------------------------------------------------------
+
+    @config.patch({"sencores": 32})
+    def test_symbolic_batch_dim_mean_reduction_split(self):
+        """Symbolic batch dim through a real reduction op (#3062/#3063).
+
+        Same shape/bounds as test_symbolic_batch_dim_pointwise_split, but
+        ``torch.mean(x, dim=-1)`` instead of ``add`` -- the batch dim (output,
+        symbolic) should still absorb all 32 cores via its granularity, while
+        the reduction dim (concrete, 128) gets split 1.
+        """
+        def fn(x):
+            return torch.mean(x, dim=-1)
+
+        x = torch.randn((1024, 128), dtype=torch.float16)
+        torch._dynamo.mark_dynamic(x, 0, min=64, max=1024)
+        comp_fn = torch.compile(fn, dynamic=False)
+        _, source_codes = run_and_get_code(comp_fn, x.to("spyre"))
+        FileCheck().check("sdsc_fused_mean").check(", 32)").check(", 1)").run(
+            source_codes[0]
+        )
+
+    @config.patch({"sencores": 32})
+    def test_symbolic_batch_dim_rms_norm_split(self):
+        """Symbolic batch dim through rms_norm's mean-of-squares reduction.
+
+        rms_norm decomposes to ``torch.mean(input * input, dim=-1, keepdim=True)``
+        (see decompositions.py:spyre_rms_norm) -- the batch dim stays symbolic
+        and is the only output dim, so it should still absorb all 32 cores.
+        """
+        def fn(x):
+            return torch.nn.functional.rms_norm(x, [128])
+
+        x = torch.randn((1024, 128), dtype=torch.float16)
+        torch._dynamo.mark_dynamic(x, 0, min=64, max=1024)
+        comp_fn = torch.compile(fn, dynamic=False)
+        _, source_codes = run_and_get_code(comp_fn, x.to("spyre"))
+        FileCheck().check(", 32)").run(source_codes[0])
+
+    @config.patch({"sencores": 32})
+    def test_symbolic_batch_dim_layer_norm_split(self):
+        """Symbolic batch dim through layer_norm's exx2/layernormscale/
+        layernormnorm chain (decompositions.py:spyre_layer_norm) -- exx2 is
+        the only true Reduction op in the chain; layernormscale/layernormnorm
+        are Pointwise (already covered by #2287) but consume exx2's output,
+        so this proves the symbolic batch dim survives the whole chain.
+        """
+        def fn(x, w, b):
+            return torch.nn.functional.layer_norm(x, [128], w, b)
+
+        x = torch.randn((1024, 128), dtype=torch.float16)
+        w = torch.randn(128, dtype=torch.float16)
+        b = torch.randn(128, dtype=torch.float16)
+        torch._dynamo.mark_dynamic(x, 0, min=64, max=1024)
+        comp_fn = torch.compile(fn, dynamic=False)
+        _, source_codes = run_and_get_code(
+            comp_fn, x.to("spyre"), w.to("spyre"), b.to("spyre")
+        )
+        FileCheck().check(", 32)").run(source_codes[0])
 
     # Need a test where changing dxp_lx_frac_avail changes the generated OpSpec
     # @config.patch({"dxp_lx_frac_avail": 0.01, "lx_planning": True})
@@ -235,6 +309,87 @@ class TestSpyreConfig(InductorTestCase):
                 len(set(args)),
                 f"Duplicate args in .run() call: {line}",
             )
+
+
+class TestSymbolicBatchReductionWorkDivision(InductorTestCase):
+    """Unit tests for #3062: symbolic batch dim through the reduction-op work
+    division path (``prioritize_dimensions`` / ``multi_dim_iteration_space_split``).
+
+    ``mean``, ``exx2``, and ``prod`` all reach these functions with the same
+    op-agnostic iteration-space shape: one output/batch dim plus one reduction
+    dim -- neither function ever inspects the op name or ``reduction_type``,
+    so a single shape-level test covers all three. ``topkvalue``/``topkindex``
+    never reach ``multi_dim_iteration_space_split`` at all: they hit the
+    single-core short-circuit in ``enumerate_work_division_candidates``
+    (``if op.data.reduction_type in TOPK_OPS: return [{v: 1 for v in it_space}]``),
+    which returns the all-ones split unconditionally, independent of whether any
+    dim in ``it_space`` is symbolic -- there is nothing to unit test there
+    beyond reading that one line. The symbolic-stick-dim guard
+    (``adjust_it_space_for_sticks`` raising ``Unsupported``, exercised by
+    ``test_symbolic_stick_dim_raises_unsupported`` above) is likewise already
+    reduction-agnostic: it inspects only the stick tensor dep, never the op.
+    """
+
+    def test_symbolic_batch_dim_is_output_dim_split_before_reduction_dim(self):
+        """A symbolic batch dim must land in ``output_dims`` (not
+        ``reduction_dims``) purely because it appears in the output's device
+        coordinates -- and, when its granularity alone can absorb every core,
+        the (concrete) reduction dim gets nothing left to split. This is the
+        priority-interaction policy #3062 asks to confirm and document."""
+        batch, reduce_dim = sympy.Symbol("c0"), sympy.Symbol("c1")
+        s0 = sympy.Symbol("s0", integer=True, positive=True)
+        it_space = {batch: s0, reduce_dim: sympy.Integer(8)}
+        # (max_size, granularity) for the symbolic batch dim, keyed by the
+        # loop variable (matches _collect_symbol_metadata's own keying).
+        symbol_meta = {batch: (1024, 32)}
+        # Only `batch` appears in the output's (non-stick) device coordinates;
+        # `reduce_dim` is collapsed away, exactly like prioritize_dimensions'
+        # own coord_vars computation.
+        output = SimpleNamespace(device_coords=[batch, sympy.Integer(0)])
+
+        output_dims, reduction_dims = prioritize_dimensions(
+            output, it_space, symbol_meta
+        )
+        self.assertEqual(output_dims, [batch])
+        self.assertEqual(reduction_dims, [reduce_dim])
+
+        splits = multi_dim_iteration_space_split(
+            it_space,
+            max_cores=32,
+            output_dims=output_dims,
+            reduction_dims=reduction_dims,
+            symbol_meta=symbol_meta,
+        )
+        # granularity=32 fully absorbs the 32-core budget in Pass 2, so Pass 3
+        # never gets a chance to touch the (concrete) reduction dim.
+        self.assertEqual(splits[batch], 32)
+        self.assertEqual(splits[reduce_dim], 1)
+
+    def test_reduction_dim_still_splits_when_cores_remain(self):
+        """A symbolic batch dim always goes first, but doesn't starve the
+        reduction dim of cores it can actually use -- if the batch dim's
+        granularity doesn't consume the whole budget, Pass 3 still splits the
+        (concrete) reduction dim with whatever is left."""
+        batch, reduce_dim = sympy.Symbol("c0"), sympy.Symbol("c1")
+        s0 = sympy.Symbol("s0", integer=True, positive=True)
+        it_space = {batch: s0, reduce_dim: sympy.Integer(8)}
+        symbol_meta = {batch: (256, 4)}  # granularity=4, doesn't fill 32 cores
+
+        output_dims, reduction_dims = prioritize_dimensions(
+            SimpleNamespace(device_coords=[batch, sympy.Integer(0)]),
+            it_space,
+            symbol_meta,
+        )
+        splits = multi_dim_iteration_space_split(
+            it_space,
+            max_cores=32,
+            output_dims=output_dims,
+            reduction_dims=reduction_dims,
+            symbol_meta=symbol_meta,
+        )
+        self.assertEqual(splits[batch], 4)
+        self.assertEqual(splits[reduce_dim], 8)
+        self.assertEqual(math.prod(splits.values()), 32)
 
 
 class TestResolveSdscSize(InductorTestCase):
@@ -399,3 +554,135 @@ class TestSdscJsonSymbolicDimSmoke(InductorTestCase):
         for stage in ("ss_", "el_"):
             sym_info = dsc["dataStageParam_"]["0"][stage]["symbolicDimInfo_"]
             self.assertEqual(sym_info, {"mb": {"maxSize_": 512, "granularity_": 64}})
+
+
+class TestSdscReductionSymbolicBatch(InductorTestCase):
+    """Unit tests for #3063: a reduction op's SDSC JSON must correctly mark the
+    reduced dim AND carry the symbolic batch dim's side-channel info on the
+    same op, and the bundle-global symbol pool must number a reduction op's
+    symbolic-dim symbol relative to whatever a preceding op in the bundle
+    already registered.
+
+    Fixture models ``mean(x, dim=-1, keepdim=True)`` (the same reduction
+    ``rms_norm``/``layer_norm`` build on, see decompositions.py:spyre_rms_norm):
+    input ``[s0, 256]`` fp16 (``s0`` symbolic, max=512, granularity=64,
+    matching TestSdscJsonSymbolicDimSmoke's fixture) reduced over its stick
+    (last) dimension; output ``[s0, 1]`` -- the reduced dim collapses to a
+    placeholder coordinate, exactly as ``_create_sdsc_tensors`` already
+    handles for any concrete reduction (mirrors the shape convention in
+    test_coarse_tiling.py's TestSharedWeightUnitBmmLayout fixtures, which use
+    ``Integer(0)`` placeholder coordinates for a collapsed dim).
+    """
+
+    _HBM_BASE = 0x400000000
+
+    def _make_reduction_op_spec(self, *, symbolic: bool) -> OpSpec:
+        c_row, c_col = sympy.Symbol("c_row"), sympy.Symbol("c_col")
+        s0 = sympy.Symbol("s0", integer=True, positive=True)
+        batch_size = s0 if symbolic else sympy.Integer(512)
+
+        input_arg = TensorArg(
+            is_input=True,
+            arg_index=0,
+            device_dtype=DataFormats.SEN169_FP16,
+            device_size=[4, 512, 64],
+            device_coordinates=[c_col // 64, c_row, sympy.Mod(c_col, 64)],
+            allocation={"hbm": self._HBM_BASE},
+        )
+        output_arg = TensorArg(
+            is_input=False,
+            arg_index=1,
+            device_dtype=DataFormats.SEN169_FP16,
+            # The reduced (stick) dim collapses to a single placeholder slot:
+            # device_size keeps the same 3-slot shape as the input (tile-count,
+            # batch, stick-elem) with the tile-count position pinned to 1.
+            device_size=[1, 512, 64],
+            device_coordinates=[sympy.Integer(0), c_row, sympy.Integer(0)],
+            allocation={"hbm": self._HBM_BASE + 0x100000000},
+        )
+        return OpSpec(
+            op="mean",
+            is_reduction=True,
+            iteration_space={
+                c_row: (batch_size, 1),
+                c_col: (sympy.Integer(256), 1),
+            },
+            args=[input_arg, output_arg],
+            op_info={},
+            symbolic_dim_bounds={"s0": (512, 64)} if symbolic else {},
+        )
+
+    def test_reduced_stick_dim_and_symbolic_batch_coexist(self):
+        """Concern #1: the scale vector must mark the reduced dim correctly
+        while a different dim on the same tensor is symbolic."""
+        op_spec = self._make_reduction_op_spec(symbolic=True)
+        sdsc_json, _, _, _ = compile_op_spec(idx=0, op_spec=op_spec, symbols=[])
+
+        top = next(iter(sdsc_json.values()))
+        dsc = next(iter(top["dscs_"][0].values()))
+
+        # The symbolic batch dim ("mb") registers exactly as it does for a
+        # pointwise op (#2673) -- reduction doesn't change dim-symbol
+        # registration.
+        self.assertEqual(dsc["dimToSymbolMapping_"], {"mb": [-1]})
+        for stage in ("ss_", "el_"):
+            sym_info = dsc["dataStageParam_"]["0"][stage]["symbolicDimInfo_"]
+            self.assertEqual(sym_info, {"mb": {"maxSize_": 512, "granularity_": 64}})
+
+        # The reduced dim ("out" -- also the stick dim here, since this models
+        # a reduction over the last/stick axis like rms_norm/layer_norm) is
+        # marked -2 (reduced AND stick) on the output tensor, while the
+        # symbolic batch dim keeps its ordinary scale of 1 on that SAME
+        # tensor -- the two markers coexist without interfering.
+        output_ds = dsc["labeledDs_"][-1]
+        dim_order = dsc["primaryDsInfo_"][output_ds["dsType_"]]["layoutDimOrder_"]
+        scale_by_dim = dict(zip(dim_order, output_ds["scale_"]))
+        self.assertEqual(scale_by_dim["mb"], 1)
+        self.assertEqual(scale_by_dim["out"], -2)
+
+        # opfunc stays "mean" (not "meannonstick"): _get_op_func only appends
+        # "nonstick" when no output dim is marked -2, i.e. when the reduction
+        # does NOT touch the stick dim -- confirming the fixture models a
+        # stick-dim reduction as intended.
+        self.assertEqual(next(iter(top["dscs_"][0])), "mean")
+
+    def test_bundle_symbol_pool_shared_across_ops(self):
+        """Concern #3: bundle.mlir's symbol IDs are drawn from the same
+        bundle-global pool -- a reduction op's ``dimension``-kind symbol must
+        be numbered relative to whatever a preceding op in the bundle already
+        registered (mirrors how bundle.py._compile_specs threads `symbols`/
+        `symbol_id_offset` across every OpSpec in a bundle), not restart at -1
+        as it would in isolation (TestSdscJsonSymbolicDimSmoke only exercises
+        the symbol_id_offset=0 case).
+        """
+        concrete_op_spec = self._make_reduction_op_spec(symbolic=False)
+        symbolic_op_spec = self._make_reduction_op_spec(symbolic=True)
+
+        symbols: list[int] = []
+        _, sym_values_a, _, _ = compile_op_spec(
+            idx=0,
+            op_spec=concrete_op_spec,
+            symbols=symbols,
+            symbol_id_offset=0,
+            use_symbols=True,
+        )
+        offset = len(sym_values_a)
+        sdsc_json_b, sym_values_b, _, _ = compile_op_spec(
+            idx=1,
+            op_spec=symbolic_op_spec,
+            symbols=symbols,
+            symbol_id_offset=offset,
+            use_symbols=True,
+        )
+
+        top_b = next(iter(sdsc_json_b.values()))
+        dsc_b = next(iter(top_b["dscs_"][0].values()))
+        self.assertEqual(dsc_b["dimToSymbolMapping_"], {"mb": [-(offset + 1)]})
+
+        # No symbol ID collisions between the two ops' entries in the shared
+        # pool: op A's ids occupy -1..-len(sym_values_a); op B's ids continue
+        # from -(offset+1) onward.
+        ids_a = {-(i + 1) for i in range(len(sym_values_a))}
+        ids_b = {-(offset + i + 1) for i in range(len(sym_values_b))}
+        self.assertEqual(ids_a & ids_b, set())
+        self.assertEqual(len(symbols), len(sym_values_a) + len(sym_values_b))

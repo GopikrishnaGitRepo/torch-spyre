@@ -130,6 +130,56 @@ vs `[floor(c1/64), z0, c0, Mod(c1, 64)]`), and that is fine: per-argument
 
 SuperDSC artifacts have to be diffable and inspectable during development, which is why JSON is the wire format. When an op gives wrong results on a particular core layout, opening the artifact in a text editor and reading that core's address mapping is usually the fastest path to a diagnosis. JSON also slots cleanly into `torch.compile`'s artifact cache.
 
+### Symbolic dims in SDSC / bundle.mlir
+
+A dim made symbolic via `torch._dynamo.mark_dynamic` (see
+[Symbolic (dynamic) dimensions](work_division_planning.md#symbolic-dynamic-dimensions))
+carries its `(max, granularity)` bounds all the way to SDSC emission on
+`OpSpec.symbolic_dim_bounds` (`dict[str, tuple[int, int]]`, keyed by the
+PyTorch symbol's name, e.g. `"s0"`), populated by `spyre_kernel.py` at
+codegen time from `ShapeEnv` — this is necessary because `ShapeEnv` itself
+is gone by the time a cached artifact is reloaded.
+
+`superdsc.py`'s `parse_op_spec` does two things with it:
+
+- **Resolves the dim to its max** (`_resolve_sdsc_size`) everywhere the
+  emitted JSON needs a concrete integer — SuperDSC has no notion of a
+  symbolic size; every iteration-space extent, device size, and stride in
+  the JSON is a plain int. This is the same worst-case-legality argument as
+  the planner's `max_size`: the generated SDSC has to stay correct for
+  every runtime value up to the traced bound.
+- **Records a side-channel** (`symbolic_dims`) mapping the SDSC's own dim
+  label (e.g. `"mb"`) to `(pytorch_sym_name, granularity, max_value)`. This
+  drives two JSON fields DeepTools/the runtime read to bind the *actual*
+  runtime shape back onto the dim at kernel-launch time:
+  - `dimToSymbolMapping_` (per-DSC): `{"mb": [-1]}` — maps the SDSC dim
+    label to the bundle-global symbol ID (see below) that carries this
+    dim's identity.
+  - `dataStageParam_["0"]["ss_"/"el_"]["symbolicDimInfo_"]`: per-core
+    `{"maxSize_": ..., "granularity_": ...}`, i.e. the planner's bounds
+    divided by whatever split `work_division.py` chose for that dim.
+
+This resolution is **op-agnostic**: whether a dim is symbolic and whether a
+dim is reduced (marked in the per-tensor `scale_` vector as `-1`, or `-2`
+when it is also the stick dim — see `_create_sdsc_tensors` in
+`superdsc.py`) are decided by completely separate code paths, so both
+markers can land on different dims of the same tensor without conflict —
+for example a `mean(dim=-1)`-shaped op with a symbolic batch dim and a
+concrete, stick-aligned reduced dim.
+
+At the bundle level, `SymbolKind.dimension(...)` (in `compute_ops.py`)
+reserves this dim's slot in the **bundle-global symbol pool**: dimension
+symbols are registered before address symbols in every SDSC, offset by
+`symbol_id_offset` (the count of symbols every *preceding* op in the bundle
+already registered — threaded through `bundle.py`'s `_compile_specs`), so
+IDs never collide across ops sharing one `bundle.mlir`. A `dimension`-kind
+entry carries no HBM byte value (a `0` placeholder is appended to the
+symbols list; `bundle.py` emits it as `%sym_N = arith.constant 0 : index`)
+— unlike address symbols, its role is purely to reserve a stable,
+bundle-unique ID that `dimToSymbolMapping_` can reference; the actual
+runtime size for that ID is bound separately, from `symbolicDimInfo_`, not
+from the constant in `bundle.mlir`'s SSA text.
+
 ### From SuperDSC to KTIR
 
 SuperDSC was designed to get Torch-Spyre running quickly with an IR that closely matches the hardware model. The team is now transitioning to KernelTile IR (KTIR), an MLIR-based representation that generalizes the concepts SuperDSC introduced (compute tiles, scratchpad staging, compile-time core partitioning) into a community specification aimed at any dataflow accelerator. See [RFC 0682 - KTIR Spec](https://github.com/torch-spyre/rfcs/blob/main/0682-KtirSpec/0682-KtirSpecRFC.md).

@@ -78,7 +78,7 @@ def _topological_sort(
     return result
 
 
-class FirstFitLayoutSolver(MemoryPlanSolver[LifetimeBoundBuffer]):
+class FirstFitLayoutSolver(MemoryPlanSolver):
     """Allocates buffers by priority score, placing each in the first gap that fits.
 
     Buffers are sorted topologically (parents before children) with ties broken by ascending

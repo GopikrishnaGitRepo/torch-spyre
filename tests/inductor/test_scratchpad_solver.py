@@ -14,6 +14,10 @@
 
 """Tests for layout solvers"""
 
+import json
+import os
+import subprocess
+import sys
 import unittest
 from unittest import TestCase
 
@@ -362,15 +366,56 @@ class BaseLayoutSolverTests:
             _assert_in_place_relationships([p, c])
 
 
+_REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+
+_DETERMINISM_SNIPPET_TEMPLATE = """
+import json
+from torch_spyre._inductor.scratchpad.plan_solver import LifetimeBoundBuffer
+from {solver_module} import {solver_class}
+def b(n, s, st, en, ipp=None):
+    return LifetimeBoundBuffer(name=n, size=s, uses=[st, en - 1], in_place_parents=ipp or [])
+# c has two in-place parents at distinct addresses, both in-place candidates for
+# its gap -> _build_gaps' iteration order decides in_place_parents[0].
+bufs = [b("pA", 100, 0, 3), b("pB", 80, 1, 3), b("c", 50, 2, 5, ["pA", "pB"])]
+{solver_class}(10_000, 1).plan_layout(bufs)
+print("RESULT " + json.dumps({{x.name: x.address for x in bufs}}))
+"""
+
+
+def _run_determinism_snippet(hashseed, solver_class_name, solver_module):
+    env = dict(
+        os.environ,
+        PYTHONHASHSEED=str(hashseed),
+        TORCH_DEVICE_BACKEND_AUTOLOAD="0",
+    )
+    snippet = _DETERMINISM_SNIPPET_TEMPLATE.format(
+        solver_class=solver_class_name, solver_module=solver_module
+    )
+    p = subprocess.run(
+        [sys.executable, "-c", snippet],
+        capture_output=True,
+        text=True,
+        env=env,
+        cwd=_REPO_ROOT,
+        timeout=60,
+    )
+    assert p.returncode == 0, p.stderr
+    line = next(ln for ln in p.stdout.splitlines() if ln.startswith("RESULT "))
+    return json.loads(line[len("RESULT ") :])
+
+
 class ScoreOrderingTests:
-    """Tests for the priority-score ordering in FirstFit/BestFit.
+    """Tests for the priority-score ordering in FirstFit/BestFit, plus a
+    cross-process determinism check for in-place parent selection.
 
     Buffers are placed in ascending order of ``(span - discount) / len(uses)``
     (lower = placed first), where ``discount`` is 0.25 per in-place
     relationship. These tests isolate the two terms the old
     shortest-lifetime-first heuristic ignored: ``len(uses)`` and the in-place
-    discount. They do not apply to the Greedy solver, whose time-stepped
-    plan_layout does not score buffers.
+    discount, plus a regression check that in-place parent selection does not
+    depend on ``PYTHONHASHSEED``. They do not apply to the Greedy solver,
+    whose time-stepped plan_layout does not score buffers and does not share
+    the ``_build_gaps``/in-place-parent-selection logic being guarded here.
     """
 
     def test_higher_use_count_placed_first(self):
@@ -418,6 +463,18 @@ class ScoreOrderingTests:
         by_name = {b.name: b.address for b in result}
         self.assertEqual(by_name["writer"], 0)
         self.assertIsNone(by_name["reader"])
+
+    def test_inplace_parent_choice_is_hashseed_independent(self):
+        """Placement must not depend on PYTHONHASHSEED (set-iteration order)."""
+        solver_class_name = self.solver_class.__name__
+        solver_module = self.solver_class.__module__
+        base = _run_determinism_snippet(0, solver_class_name, solver_module)
+        for hashseed in range(1, 10):
+            self.assertEqual(
+                _run_determinism_snippet(hashseed, solver_class_name, solver_module),
+                base,
+                f"PYTHONHASHSEED={hashseed}",
+            )
 
 
 class TestFirstFitLayoutSolver(ScoreOrderingTests, BaseLayoutSolverTests, TestCase):

@@ -138,6 +138,7 @@ def enable_spyre_compile_fx_wrapper():
 
 def _light_autoload():
     from . import decompositions  # noqa: F401
+    from . import distributed as _distributed_init  # noqa: F401  registers spyre::broadcast_async/wait_work
 
     enable_spyre_compile_fx_wrapper()
 

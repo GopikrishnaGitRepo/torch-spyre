@@ -535,9 +535,12 @@ def _create_sdsc_tensors(
             else _get_data_format(op_spec.op, arg.device_dtype)
         )
 
+        # allocation keys are mutually exclusive (see TensorArg.allocation
+        # docstring in op_spec.py); this chain just reads whichever one is
+        # present. Priority order here is cosmetic, not semantic.
         start_addr = (
-            arg.allocation.get("pool")
-            if "pool" in arg.allocation
+            arg.allocation.get("hbm_pool")
+            if "hbm_pool" in arg.allocation
             else arg.allocation.get("lx")
             if "lx" in arg.allocation
             else arg.allocation.get("hbm")

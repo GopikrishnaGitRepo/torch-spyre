@@ -1788,7 +1788,7 @@ class TestSharedWeightUnitBmmLayout(unittest.TestCase):
                 Integer(0),
                 Mod(c2, 64),
             ],
-            allocation={"pool": 0},
+            allocation={"hbm_pool": 0},
         )
         kernel_arg = TensorArg(
             is_input=True,

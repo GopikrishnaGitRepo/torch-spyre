@@ -532,7 +532,7 @@ class SpyreKernel(Kernel[CSEVariable]):
         )
         if (
             "lx" not in tensor.layout.allocation
-            and "pool" not in tensor.layout.allocation
+            and "hbm_pool" not in tensor.layout.allocation
         ):
             self.spyre_kernel_args.append((name, tensor_arg))
         return tensor_arg
@@ -723,7 +723,7 @@ class SpyreKernel(Kernel[CSEVariable]):
                 continue
             layout = buf.get_layout()
             if isinstance(layout, FixedTiledLayout) and (
-                "lx" in layout.allocation or "pool" in layout.allocation
+                "lx" in layout.allocation or "hbm_pool" in layout.allocation
             ):
                 self.remove_buffer(name)
 
@@ -737,7 +737,7 @@ class SpyreKernel(Kernel[CSEVariable]):
         if not isinstance(layout, FixedTiledLayout):
             raise Unsupported(f"{name} does not have FixedTiledLayout")
         index = sympy_subs(index, V.graph.sizevars.precomputed_replacements)
-        if "lx" not in layout.allocation and "pool" not in layout.allocation:
+        if "lx" not in layout.allocation and "hbm_pool" not in layout.allocation:
             _ = self.args.input(name)
 
         if logger.isEnabledFor(logging.DEBUG):
@@ -764,7 +764,7 @@ class SpyreKernel(Kernel[CSEVariable]):
         layout = buf.get_layout()
         if not isinstance(layout, FixedTiledLayout):
             raise Unsupported(f"{real_dst_name} does not have FixedTiledLayout")
-        # Pool buffers are intermediates whose address is baked into the TensorArg
+        # HBM-pool buffers are intermediates whose address is baked into the TensorArg
         # allocation dict; registering them as outputs would overflow SEGMENT_OFFSETS.
         # (lx buffers are already excluded from spyre_kernel_args in _tensor_arg.)
         # Also skip buffers marked as removed by Inductor's optimizer (e.g., by LX )
@@ -772,7 +772,7 @@ class SpyreKernel(Kernel[CSEVariable]):
         # buffers that later get marked as dead code.
         real_dst_name = V.graph.scheduler.mutation_real_name.get(name, name)
         is_removed = real_dst_name in V.graph.removed_buffers
-        if "pool" not in layout.allocation and not is_removed:
+        if "hbm_pool" not in layout.allocation and not is_removed:
             # Pass the alias here, not real_dst_name: args.output resolves the
             # mutation alias internally. (load() passes the pre-resolved real
             # name to args.input, which does not resolve.)
@@ -870,10 +870,10 @@ class SpyreKernel(Kernel[CSEVariable]):
         layout = buf.get_layout()
         if not isinstance(layout, FixedTiledLayout):
             raise Unsupported(f"{name} does not have FixedTiledLayout")
-        # Pool buffers are intermediates whose address is baked into the TensorArg
+        # HBM-pool buffers are intermediates whose address is baked into the TensorArg
         # allocation dict; registering them as outputs would overflow SEGMENT_OFFSETS.
         # (lx buffers are already excluded from spyre_kernel_args in _tensor_arg.)
-        if "pool" not in layout.allocation:
+        if "hbm_pool" not in layout.allocation:
             _ = self.args.output(name)
         index = sympy_subs(index, V.graph.sizevars.precomputed_replacements)
         dst = TensorAccess(name, index, layout)
@@ -960,8 +960,8 @@ class SpyreKernel(Kernel[CSEVariable]):
 
         # Now that all loads/stores have been processed we know the final kernel_args and can map names to indices
         actuals = self.args.python_argdefs()[1]
-        pool_size = getattr(V.graph, "pool_size", 0)
-        has_pool_allocations = pool_size > 0
+        hbm_pool_size = getattr(V.graph, "hbm_pool_size", 0)
+        has_pool_allocations = hbm_pool_size > 0
 
         for name, tensor_arg in self.spyre_kernel_args:
             tensor_arg.arg_index = actuals.index(name)
@@ -986,12 +986,12 @@ class SpyreKernel(Kernel[CSEVariable]):
         buf.writeline("]")
         return buf.getvalue()
 
-    def _kernel_uses_pool(self) -> bool:
-        """Return True if any op in this kernel references a pool-allocated tensor."""
+    def _kernel_uses_hbm_pool(self) -> bool:
+        """Return True if any op in this kernel references an HBM-pool-allocated tensor."""
         from torch_spyre._inductor.op_spec import TensorArg
 
         return any(
-            "pool" in arg.allocation
+            "hbm_pool" in arg.allocation
             for op in _iter_op_specs(self.op_specs)
             for arg in op.args
             if isinstance(arg, TensorArg)
@@ -1002,7 +1002,7 @@ class SpyreKernel(Kernel[CSEVariable]):
         wrapper = V.graph.wrapper_code
         call_args = []
 
-        if self._kernel_uses_pool():
+        if self._kernel_uses_hbm_pool():
             call_args.append("_pool")
 
         # Add remaining kernel arguments, deduplicating tensors that appear as

@@ -383,7 +383,7 @@ def insert_post_mutation_restickify(graph: GraphLowering) -> None:
         assert graph_input is not None
 
         # Create fresh layouts here, since reusing base_layout would overwrite
-        # arg0_1's address during memory_planning.
+        # arg0_1's address during hbm_pool_planning.
         target_input_buf = graph_input.data.data
         base_layout = target_input_buf.layout  # FixedTiledLayout(alt_stl)
         buf_tmp_layout = _fixed_tiled(base_layout, alt_stl)

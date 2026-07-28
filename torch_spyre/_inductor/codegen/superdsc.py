@@ -767,10 +767,13 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
     )
 
     if is_non_identity_dtype_op and op_stick_dim is None:
-        input_stick_sym = Symbol(INPUT_DIM_LABELS[ndim])
+        input_stick_label_idx = ndim if ndim != 0 else ndim + 1
+        input_stick_sym = Symbol(INPUT_DIM_LABELS[input_stick_label_idx])
         sdsc_iteration_space[input_stick_sym] = op_spec.args[
             0
         ].device_dtype.elems_per_stick()
+        work_slices[input_stick_sym] = 1
+        dim_splits[input_stick_sym] = 1
         output_stick_sym = Symbol(OUTPUT_DIM_LABELS[0])
         sdsc_iteration_space[output_stick_sym] = max(
             arg.device_dtype.elems_per_stick() for arg in op_spec.args

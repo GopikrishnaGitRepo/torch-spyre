@@ -196,19 +196,24 @@ def _serialize_value(v):
         return repr(int(v))
     elif isinstance(v, sympy.Basic):
         # Concretize: first try direct float conversion for concrete numerics,
-        # then fall back to substituting size_hints for symbolic expressions.
+        # then fall back to substituting hints for symbolic expressions.
         if hasattr(v, "free_symbols") and v.free_symbols:
-            # Substitute each symbol individually (size_hint handles simple
-            # Symbol lookups reliably), then evaluate.  This works for float
-            # expressions like 1.0/s97 where size_hint on the whole expression
-            # might not handle the float division correctly.
-            subs = {s: V.graph.sizevars.size_hint(s) for s in v.free_symbols}
+            # Substitute each symbol individually (guarding_hint_or_throw handles
+            # simple Symbol lookups reliably), then evaluate.  This works for float
+            # expressions like 1.0/s97 where a hint on the whole expression might
+            # not handle the float division correctly.  This value is baked into
+            # generated kernel source, so use the strict hint: resolve backed
+            # symbols to their true value and raise on unbacked ones rather than
+            # emitting an optimization fallback.
+            subs = {
+                s: V.graph.sizevars.guarding_hint_or_throw(s) for s in v.free_symbols
+            }
             concrete = float(v.subs(subs))
             return repr(concrete)
         try:
             return repr(float(v))
         except (TypeError, ValueError):
-            return repr(V.graph.sizevars.size_hint(v))
+            return repr(V.graph.sizevars.guarding_hint_or_throw(v))
     elif isinstance(v, dict):
         items = ", ".join(f"{repr(k)}: {_serialize_value(val)}" for k, val in v.items())
         return "{" + items + "}"
@@ -361,7 +366,10 @@ class SpyreOpFuncs:
         return PointwiseOp("tanh", [x])
 
     @staticmethod
-    def to_dtype(x, dtype, src_dtype):
+    def to_dtype(x, dtype, src_dtype, use_compute_types=False):
+        # PT 2.12 passes a new `use_compute_types` kwarg through OpsHandler.
+        # Spyre maps directly to fixed hardware ops via DtypeOpTable and
+        # cannot honor compute-type promotion, so accept and ignore.
         assert dtype != src_dtype
 
         op = DtypeOpTable.get_operator(src_dtype, dtype)

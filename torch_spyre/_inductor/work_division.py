@@ -100,7 +100,7 @@ def _collect_symbol_metadata(it_space: dict[Symbol, Expr]) -> SymbolMeta:
     finite upper bound. Auto-dynamic symbols (Dynamo promoting an int on
     retrace when a Python loop varies it) have no finite max, so we skip
     them here and let them fall through to the existing
-    ``concretize_expr`` + ``size_hint`` path.
+    ``concretize_expr`` + ``optimization_hint`` path.
 
     Concrete dims (no free symbols) are also omitted, so callers can use
     ``v in meta`` to detect both cases.
@@ -570,7 +570,7 @@ def must_split_vars(
             # Still above the limit. If this coord still evaluates to > 1 under
             # the committed splits, inner dimensions cannot reduce the span further.
             # Use _effective_size so symbolic dims substitute their max_size
-            # rather than a misleading size_hint.
+            # rather than a misleading optimization_hint.
             per_core_coord_size = (
                 max(
                     int(
@@ -1553,7 +1553,7 @@ def _cost_model_divide_op(op: ComputedBuffer, max_cores: int) -> bool:
     # symbolic batchmatmul needs symmetric changes inside the cost model
     # (_matmul_split_cost concretises M, N, K) and is tracked as a follow-up.
     # Raise loudly so users do not silently get a plan based on
-    # the warmup size_hint.
+    # the warmup optimization_hint.
     if symbol_meta:
         raise Unsupported(
             f"symbolic dim(s) {sorted(map(str, symbol_meta))} on batchmatmul "

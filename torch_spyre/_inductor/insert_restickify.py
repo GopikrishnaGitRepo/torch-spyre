@@ -14,6 +14,7 @@
 
 import logging
 from collections import defaultdict
+from typing import cast
 
 import torch
 
@@ -270,7 +271,7 @@ def finalize_layouts(graph: GraphLowering) -> None:
         # until after the scheduler runs
         if op_layouts and not isinstance(op.layout, MutationLayoutSHOULDREMOVE):
             stl = committed if cost_fn else op_layouts[0]
-            op.layout = _fixed_tiled(op.layout, stl)
+            op.layout = _fixed_tiled(op.layout, cast(SpyreTensorLayout, stl))
 
         # For each input edge, schedule a restickify if the input's committed STL
         # is incompatible with what this op requires on that edge.

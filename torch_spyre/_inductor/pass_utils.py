@@ -797,6 +797,9 @@ def iteration_space(n: SchedulerNode) -> dict[sympy.Symbol, sympy.Expr]:
         return next(iter(n.read_writes.writes)).ranges.copy()
     elif isinstance(n.node.data, Reduction):
         # Output dims from the write dep; reduction dims appended from read deps.
+        # Inductor shares sympy symbols across all tensor accesses in a Reduction's
+        # inner_fn, so the if-not-in guard correctly deduplicates without producing
+        # spurious dims even for multi-input reductions (matmul, conv2d, etc.).
         result = next(iter(n.read_writes.writes)).ranges.copy()
         for dep in n.read_writes.reads:
             if isinstance(dep, StarDep):
@@ -817,6 +820,9 @@ def iteration_space_from_op(op: ComputedBuffer) -> dict[sympy.Symbol, sympy.Expr
         return next(iter(rw.writes)).ranges.copy()
     elif isinstance(op.data, Reduction):
         # Output dims from write dep; reduction dims appended from read deps.
+        # Inductor shares sympy symbols across all tensor accesses in a Reduction's
+        # inner_fn, so the if-not-in guard correctly deduplicates without producing
+        # spurious dims even for multi-input reductions (matmul, conv2d, etc.).
         result = next(iter(rw.writes)).ranges.copy()
         for dep in rw.reads:
             if isinstance(dep, StarDep):

@@ -36,6 +36,7 @@ from torch._inductor.ir import Operation
 from torch._inductor.scheduler import BaseSchedulerNode
 
 from .logging_utils import get_inductor_logger
+from .provenance import SpyreGraphTransformObserver, reset_provenance_warnings
 
 from .padding import insert_bmm_padding
 from .temp_passes import (
@@ -154,6 +155,9 @@ class _SpyreGraphPassPipeline(CustomGraphPass):
     def __call__(self, graph: torch.fx.graph.Graph) -> None:
         if not self._has_spyre_device(graph):
             return
+        # FX-graph passes are already observed by upstream Inductor's
+        # GraphTransformObserver (populates node.meta["from_node"]); no Spyre
+        # observer is wrapped here.
         for p in self.passes:
             p(graph)
 
@@ -173,8 +177,17 @@ class _SpyreNodePassPipeline(CustomSchedulerPass):
     def __call__(self, target: list[BaseSchedulerNode]) -> list[BaseSchedulerNode]:
         if not self._has_spyre_device(target):
             return target
+        # This pipeline is a per-compile entry point for the observed passes,
+        # so clear the dedup here so each compile warns afresh.
+        reset_provenance_warnings()
         for pass_fn in self.passes:
-            target = pass_fn(target)
+            name = _get_pass_name(pass_fn)
+            observer = SpyreGraphTransformObserver(target, name, kind="node")
+            with observer:
+                target = pass_fn(target)
+                # Reconcile the returned list while recursively inspecting the
+                # underlying buffers through scheduler get_nodes().
+                observer.target = target
         return target
 
     def uuid(self) -> Any | None:
@@ -424,22 +437,31 @@ class CustomPreSchedulingPasses:
         if not _operations_have_spyre_device(graph.operations):
             return
 
+        # This pipeline is a per-compile entry point for the observed passes,
+        # so clear the dedup here so each compile warns afresh.
+        reset_provenance_warnings()
+
         if logger.isEnabledFor(logging.INFO):
             logger.info(
                 "BEFORE PRE-SCHEDULING\n%s", format_operations(graph.operations)
             )
 
         for pass_fn in self.passes:
-            t0 = time.perf_counter()
-            pass_fn(graph)
+            pass_name = _get_pass_name(pass_fn)
+            # `graph` is the same object throughout -- passes mutate
+            # `graph.operations` in place -- so before/after reconciliation
+            # is exact here.
+            with SpyreGraphTransformObserver(graph, pass_name, kind="graphlowering"):
+                t0 = time.perf_counter()
+                pass_fn(graph)
+                elapsed_ms = (time.perf_counter() - t0) * 1000
+
             if logger.isEnabledFor(logging.INFO):
                 logger.info(
                     "elapsed %5dms  %s",
-                    (time.perf_counter() - t0) * 1000,
-                    _get_pass_name(pass_fn),
+                    elapsed_ms,
+                    pass_name,
                 )
-
-            pass_name = _get_pass_name(pass_fn)
             if logger.isEnabledFor(logging.DEBUG) and _should_log_pass(pass_name):
                 logger.debug(
                     "AFTER %s\n%s", pass_name, format_operations(graph.operations)

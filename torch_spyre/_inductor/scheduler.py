@@ -22,6 +22,7 @@ from torch._inductor.utils import (
     get_fused_kernel_name,
     sympy_product,
 )
+from torch._inductor.dependencies import MemoryDep
 from torch._inductor.scheduler import (
     BaseScheduling,
     BaseSchedulerNode,
@@ -310,6 +311,91 @@ def build_loop_scheduler_nodes(
                 seen[key] = name
 
     return result
+
+
+def _lx_resident(node: SchedulerNode) -> bool:
+    """True if ``node``'s output buffer was pinned into LX by scratchpad planning."""
+    allocation = getattr(getattr(node.node, "layout", None), "allocation", None)
+    return allocation is not None and "lx" in allocation
+
+
+def align_lx_producer_loop_order(
+    nodes: list[BaseSchedulerNode],
+) -> list[BaseSchedulerNode]:
+    """Pre-fusion pass: match an LX buffer's producer loop order to its consumers'.
+
+    LX is per-core scratchpad, so every op touching an LX-resident buffer must
+    agree on which core owns which slice.  That mapping is *positional*:
+    ``core_to_slice_mapping`` hands out ``core_id`` strides in iteration-space
+    order, so a producer that walks the buffer in a different dim order than its
+    consumers read it gets a transposed core->slice assignment.  The split
+    factors still multiply to the same core count, so nothing downstream
+    complains -- each core simply reads the slice a different core wrote, and the
+    kernel silently returns another core's data.
+
+    Scratchpad planning creates the clone that pins a graph input into LX, and it
+    builds that clone in the buffer's natural dim order, which need not match how
+    the consumers read it.  Through PyTorch 2.12 Inductor's
+    ``loop_ordering_after_fusion`` happened to rewrite the clone into the
+    consumers' order, so the assignments lined up by accident.  As of 2.13 the
+    reorder is computed and then discarded (see
+    ``Scheduler._try_reorder_loops_for_candidates``), which exposed the
+    incoherence as wrong results for any two reductions sharing one LX-pinned
+    input.  Align the orders here so correctness does not rest on an Inductor
+    scoring heuristic.
+
+    Consumers of an LX buffer are already known to agree with each other -- a
+    disagreement is a core-division mismatch that keeps the buffer in HBM (see
+    ``get_ncores_for_buffers``) -- so matching the first consumer matches all.
+    """
+    producers: dict[str, SchedulerNode] = {}
+    for node in nodes:
+        if isinstance(node, SchedulerNode) and _lx_resident(node):
+            for dep in node.read_writes.writes:
+                if isinstance(dep, MemoryDep):
+                    producers[dep.name] = node
+
+    if not producers:
+        return nodes
+
+    # Keyed by producer, not by buffer: reordering a producer twice would leave
+    # it matching only whichever consumer came last.  A ComputedBuffer has a
+    # single output (multi-output ops carry no device_layout and never reach LX),
+    # so one alignment per producer covers every LX buffer it writes.
+    aligned: OrderedSet[str] = OrderedSet()
+    for node in nodes:
+        if not isinstance(node, SchedulerNode):
+            continue
+        for read in node.read_writes.reads:
+            if not isinstance(read, MemoryDep):
+                continue
+            producer = producers.get(read.name)
+            if producer is None or producer is node:
+                continue
+            if producer.get_name() in aligned:
+                continue
+            write = next(
+                (
+                    dep
+                    for dep in producer.read_writes.writes
+                    if isinstance(dep, MemoryDep) and dep.name == read.name
+                ),
+                None,
+            )
+            if write is None:
+                continue
+            # Reorders `producer`'s loops so its write dep matches `read`.
+            if producer.reorder_loops_by_dep_pair(write, read):
+                aligned.add(producer.get_name())
+                logger.debug(
+                    "align_lx_producer_loop_order: %s reordered to match %s's "
+                    "read of LX buffer %s",
+                    producer.get_name(),
+                    node.get_name(),
+                    read.name,
+                )
+
+    return nodes
 
 
 class SuperDSCScheduling(BaseScheduling):

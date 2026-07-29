@@ -77,7 +77,7 @@ from .scratchpad.allocator import (
     scratchpad_planning,
 )
 from .fusion import spyre_fuse_nodes
-from .scheduler import build_loop_scheduler_nodes
+from .scheduler import align_lx_producer_loop_order, build_loop_scheduler_nodes
 from .constants import DEVICE_NAME
 from .deadcode_elimination import deadcode_elimination
 from .dedup_constants import dedup_and_promote_constants
@@ -238,7 +238,16 @@ class CustomPreFusionPasses(_SpyreNodePassPipeline):
     # are visible to SuperDSCScheduling.can_fuse_vertical/horizontal (which return
     # False), so loop groups survive Inductor fusion intact.
     def __init__(self):
-        super().__init__([propagate_mutation_layouts, build_loop_scheduler_nodes])
+        # align_lx_producer_loop_order runs before build_loop_scheduler_nodes so
+        # it still sees plain SchedulerNodes (the only kind that can reorder
+        # their loops) rather than CountedLoopSchedulerNode wrappers.
+        super().__init__(
+            [
+                propagate_mutation_layouts,
+                align_lx_producer_loop_order,
+                build_loop_scheduler_nodes,
+            ]
+        )
 
 
 class CustomPostFusionPasses(_SpyreNodePassPipeline):

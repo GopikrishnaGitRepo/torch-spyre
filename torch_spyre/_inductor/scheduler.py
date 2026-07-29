@@ -34,9 +34,10 @@ from torch._inductor.codecache import code_hash
 from torch.utils._ordered_set import OrderedSet
 
 from .spyre_kernel import SpyreKernel
-from .pass_utils import iteration_space
+from .pass_utils import iteration_space, per_core_view_scheduled
 from .logging_utils import get_inductor_logger
 from .op_spec import LoopSpec
+from . import config as _spyre_config
 
 logger = get_inductor_logger("scheduler")
 
@@ -394,6 +395,82 @@ def align_lx_producer_loop_order(
                     node.get_name(),
                     read.name,
                 )
+
+    return nodes
+
+
+def demote_incoherent_lx_buffers(
+    nodes: list[BaseSchedulerNode],
+) -> list[BaseSchedulerNode]:
+    """Post-fusion pass: drop an LX buffer whose users disagree on core->slice.
+
+    LX planning runs before the Scheduler exists, so it reasons about each op's
+    *pre*-scheduler ranges. ``core_to_slice_mapping`` is positional -- it hands
+    ``core_id`` strides out in iteration-space order -- and Inductor's
+    ``loop_ordering_after_fusion`` may permute a fused op's ranges after planning
+    has already committed. When it permutes one user of an LX buffer and not
+    another, the two disagree about which core owns which slice: each core writes
+    one slice and reads back a different one. LX is per-core scratchpad with no
+    other copy, so the read is silently wrong (#2062).
+
+    Planning cannot see that permutation, so re-check here, where the ranges are
+    final, and demote any buffer whose users no longer agree. Clearing ``"lx"``
+    is all that is needed: this runs before ``hbm_pool_planning``, which claims
+    exactly the intermediates LX did not, so a demoted buffer lands in the HBM
+    intermediates segment on its way through.
+
+    Deliberately verification-only -- it never *adds* residency and never
+    rewrites a loop order, so it cannot perturb a graph whose users already
+    agree.
+
+    Complements :func:`align_lx_producer_loop_order`, which runs pre-fusion and
+    rewrites a producer's loop order to match its consumers'. That pass fixes the
+    incoherence it can reach; this one is the backstop for what it cannot -- a
+    disagreement introduced after it ran, or a view too irregular to represent --
+    where the only safe answer is to give up LX residency.
+    """
+    if not _spyre_config.lx_planning:
+        return nodes
+
+    # dep is needed per (node, buffer): a node reading and writing the same
+    # buffer contributes one entry per access, so an in-place op whose read and
+    # write views diverge is caught too.
+    users: dict[str, list[tuple[SchedulerNode, MemoryDep]]] = {}
+    lx_names: OrderedSet[str] = OrderedSet()
+    for node in nodes:
+        for inner in node.get_nodes():
+            if not isinstance(inner, SchedulerNode):
+                continue
+            if _lx_resident(inner):
+                for dep in inner.read_writes.writes:
+                    if isinstance(dep, MemoryDep):
+                        lx_names.add(dep.name)
+            rw = inner.read_writes
+            for dep in list(rw.reads) + list(rw.writes):
+                if isinstance(dep, MemoryDep):
+                    users.setdefault(dep.name, []).append((inner, dep))
+
+    for name in lx_names:
+        ref = None
+        culprit = None
+        for node, dep in users.get(name, []):
+            view, _, representable = per_core_view_scheduled(node, dep, name)
+            if not representable:
+                culprit = f"{node.get_name()} view unrepresentable"
+                break
+            if ref is None:
+                ref = view
+            elif view != ref:
+                culprit = f"{node.get_name()} disagrees: {view} != {ref}"
+                break
+        if culprit is None:
+            continue
+        buf = V.graph.try_get_buffer(name)
+        layout = getattr(buf, "layout", None)
+        allocation = getattr(layout, "allocation", None)
+        if allocation is not None:
+            allocation.pop("lx", None)
+        logger.info("demoted %s out of LX: %s", name, culprit)
 
     return nodes
 

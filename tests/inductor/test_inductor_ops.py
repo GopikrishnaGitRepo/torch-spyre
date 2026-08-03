@@ -634,6 +634,8 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     ((67, 256),) * 2,
                     ((67, 71, 256),) * 2,
                     ((7, 12, 32, 64),) * 2,
+                    # broadcasting case
+                    ((2880,), (1, 11, 2880)),
                 ]
             ),
         },

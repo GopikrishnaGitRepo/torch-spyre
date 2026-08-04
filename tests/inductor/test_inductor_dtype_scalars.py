@@ -392,6 +392,30 @@ class TestDatatypeScalarOperations:
         s = torch.tensor(2.0, dtype=torch.float32)
         _compare_modes(execution_mode, add_scalar, x, s, atol=1e-3, rtol=1e-3)
 
+    @pytest.mark.parametrize(
+        "src_dtype,dst_dtype",
+        [
+            (torch.float32, torch.float16),
+            (torch.float16, torch.float32),
+        ],
+    )
+    def test_0dim_scalar_dtype_conversion(self, execution_mode, src_dtype, dst_dtype):
+        """
+        Regression test: explicit ``.to()`` dtype conversion on a 0-D scalar
+        tensor.
+
+        Exercises the fp32<->fp16 dtype-conversion SDSC op directly on a 0-D
+        tensor (``op_stick_dim`` is ``None``, same code path as
+        ``test_add_0dim_fp32_scalar_to_fp16_tensor``), independent of the
+        implicit conversion performed inside ``x + s``.
+        """
+
+        def convert_scalar(s):
+            return s.to(dst_dtype)
+
+        s = torch.tensor(2.0, dtype=src_dtype)
+        _compare_modes(execution_mode, convert_scalar, s, atol=1e-3, rtol=1e-3)
+
     @torch._dynamo.config.patch(assume_static_by_default=False)
     def test_dtype_conversion_with_symbolic_dimensions(self, execution_mode):
         """

@@ -1259,6 +1259,17 @@ def generate_sdsc(
         its non-overlapping stride==kernel windows the two coincide anyway).
         """
         ps = sdsc_spec.padding_sizes.get(str(dim)) if is_input else None
+        # torch-spyre#2851 (experimental): _strided_substick_sdsc_fields uses
+        # the real "ki" enum label for windowDim_ (an invented label isn't a
+        # valid PrimaryDimTypes and crashes the DDC deserializer), which
+        # collides with avgpool/conv2d's own genuine "ki"/"kj" window dims --
+        # so this intentionally does NOT widen the gate to cover our new case
+        # (that would also newly activate this per-core-size formula for
+        # avgpool's own windowDim_-bearing padding_sizes, an untested change
+        # to working code). Left exactly as opfunc=="conv2d"-gated; the
+        # strided-substick experiment reached its current failure point
+        # (DeepTools' LX buffer-capacity check) via the padding_sizes JSON
+        # metadata alone, without this per-core-size path ever firing for it.
         if sdsc_spec.opfunc == "conv2d" and ps is not None and "windowDim_" in ps:
             out_per_core = sdsc_spec.iteration_space[dim] // nsplits
             stride = int(ps.get("stride_", 1))
@@ -1280,6 +1291,17 @@ def generate_sdsc(
         per-core size -- so avgpool's original behavior is unchanged.
         """
         ps = sdsc_spec.padding_sizes.get(str(dim)) if is_input else None
+        # torch-spyre#2851 (experimental): _strided_substick_sdsc_fields uses
+        # the real "ki" enum label for windowDim_ (an invented label isn't a
+        # valid PrimaryDimTypes and crashes the DDC deserializer), which
+        # collides with avgpool/conv2d's own genuine "ki"/"kj" window dims --
+        # so this intentionally does NOT widen the gate to cover our new case
+        # (that would also newly activate this per-core-size formula for
+        # avgpool's own windowDim_-bearing padding_sizes, an untested change
+        # to working code). Left exactly as opfunc=="conv2d"-gated; the
+        # strided-substick experiment reached its current failure point
+        # (DeepTools' LX buffer-capacity check) via the padding_sizes JSON
+        # metadata alone, without this per-core-size path ever firing for it.
         if sdsc_spec.opfunc == "conv2d" and ps is not None and "windowDim_" in ps:
             out_per_core = sdsc_spec.iteration_space[dim] // nsplits
             return out_per_core * int(ps.get("stride_", 1))

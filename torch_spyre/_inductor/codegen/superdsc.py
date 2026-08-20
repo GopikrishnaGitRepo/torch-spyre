@@ -17,7 +17,7 @@ import math
 from collections import Counter
 from typing import Any
 
-from sympy import Expr, Integer, Symbol
+from sympy import Expr, Integer, Mod, Mul, Symbol
 from torch._inductor.virtualized import V
 
 from torch_spyre._C import DataFormats
@@ -800,6 +800,88 @@ def _avgpool_sdsc_fields(iteration_space: dict, pool_params: dict) -> dict:
         "input_coord_sizes": input_coord_sizes,
         "emit_memorg_padding": True,
     }
+
+
+def _strided_substick_sdsc_fields(
+    op_spec: "OpSpec", iteration_space: dict, symbol_mapping: dict
+) -> dict:
+    """Compute window/stride SDSC fields for a strided (step>1) sub-stick read.
+
+    EXPERIMENTAL (torch-spyre#2851): a strided slice landing inside a stick
+    (e.g. ``t[:, ::2]``) produces an input device coordinate of the scaled
+    form ``coeff * Mod(var, N)``, coeff > 1. The DDC dimension-mapping search
+    cannot place that stride directly on an ordinary (unpadded) dim -- see
+    ``ddl_conversion.cpp``'s ``tryDimMapping`` -- but conv2d/avgpool already
+    use ``MetaDimKind::Stride``/``WindowDim`` padding metadata to describe a
+    sliding window with a real stride. A stride with kernel size 1 is exactly
+    a strided *selection*, no reduction -- the same shape as our access
+    pattern. This reuses that existing mechanism instead of introducing a new
+    one, generalizing ``generate_sdsc``'s window-size computation (see
+    ``_coord_per_core_size``/``_coord_core_stride`` below) beyond
+    ``opfunc == "conv2d"``.
+
+    The ``windowDim_`` label is deliberately a synthetic name absent from
+    ``iteration_space``: ``generate_sdsc`` looks up the window/kernel size as
+    ``iteration_space.get(Symbol(windowDim_), 1)``, so an absent symbol
+    correctly resolves to kernel size 1 without requiring a real second loop
+    dimension for the (degenerate, size-1) window.
+
+    Unverified whether the DDC's window-mapping logic was ever exercised with
+    kernel size 1 on a non-conv op; this is a direct empirical test of that.
+    """
+    padding_sizes: dict = {}
+    window_dims: set = set()
+    for arg in op_spec.args:
+        if not arg.is_input:
+            continue
+        if not arg.device_coordinates:
+            continue
+        last = arg.device_coordinates[-1]
+        if symbol_mapping:
+            last = last.subs(symbol_mapping)
+        if not isinstance(last, Mul):
+            continue
+        coeff, mod_part = last.as_coeff_Mul()
+        if not (
+            isinstance(coeff, Integer)
+            and coeff > 1
+            and isinstance(mod_part, Mod)
+            and len(mod_part.args[0].free_symbols) == 1
+        ):
+            continue
+        var = next(iter(mod_part.args[0].free_symbols))
+        if var not in iteration_space or str(var) in padding_sizes:
+            continue
+        out_extent = int(iteration_space[var])
+        stride = int(coeff)
+        min_span = (out_extent - 1) * stride + 1
+        # Any LX-resident chunk must be a whole number of sticks (the
+        # hardware's atomic 128-byte addressing unit) -- L3DlOpsScheduler's
+        # getLabeledDsNumOfStickVolumesInCore DT_CHECKs
+        # chunkSizeInBytes % bytesPerStick == 0. The tight conv-style
+        # min_span (e.g. 127 for a 64-wide, stride-2 read) is not
+        # stick-aligned; round up to the next whole stick.
+        elems_per_stick = arg.device_dtype.elems_per_stick()
+        total_size = -(-min_span // elems_per_stick) * elems_per_stick
+        padding_sizes[str(var)] = {
+            "padFront_": 0,
+            "padBack_": 0,
+            "totalSize_": total_size,
+            "stride_": stride,
+            "dilation_": 1,
+            # "ki" is a real PrimaryDimTypes enum member (dims.h) that conv2d
+            # uses for its kernel dim; windowDim_ is deserialized straight
+            # into that enum (see EnumsConversion in ddl_conversion.cpp), so
+            # an invented label throws std::out_of_range there. "ki" is not
+            # one of our op's own iteration-space symbols, so
+            # iteration_space.get(Symbol("ki"), 1) below correctly defaults
+            # to kernel size 1 without a real second loop dimension.
+            "windowDim_": "ki",
+        }
+        window_dims.add(str(var))
+    if not padding_sizes:
+        return {}
+    return {"padding_sizes": padding_sizes, "window_dims": frozenset(window_dims)}
 
 
 def _conv2d_sdsc_fields(
@@ -2120,6 +2202,16 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
         else {}
     )
 
+    # EXPERIMENTAL (torch-spyre#2851): only attempted for plain ops -- if this
+    # op is already pool/conv/depthwise-conv, one of the dicts above is
+    # non-empty and takes precedence, so this stays empty to avoid colliding
+    # window_dims/padding_sizes keys.
+    strided_substick_sdsc_fields = (
+        _strided_substick_sdsc_fields(op_spec, sdsc_iteration_space, symbol_mapping)
+        if not (pool_sdsc_fields or conv2d_sdsc_fields or window_sdsc_fields)
+        else {}
+    )
+
     return (
         SDSCSpec(
             opfunc=(
@@ -2156,6 +2248,7 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
             **pool_sdsc_fields,
             **conv2d_sdsc_fields,
             **window_sdsc_fields,
+            **strided_substick_sdsc_fields,
         ),
         symbol_mapping,
     )

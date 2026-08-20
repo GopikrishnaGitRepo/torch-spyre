@@ -528,7 +528,7 @@ class TestScaledModStickExpr(TestCase):
                 "coordinates": [sympy.floor(d1 / 32), d0, 2 * sympy.Mod(d1, 32)],
             },
         ]
-        _, new_tensors = align_tensors(iteration_space, tensors)  # must not raise
+        _, new_tensors, _ = align_tensors(iteration_space, tensors)  # must not raise
         # The final (stick-dim) coordinate must retain the *2 scale factor;
         # it must not collapse to the unscaled `Mod(d1, 64)`.
         self.assertEqual(new_tensors[0]["coordinates"][-1], 2 * sympy.Mod(d1, 32))
@@ -545,7 +545,7 @@ class TestScaledModStickExpr(TestCase):
                 "coordinates": [sympy.floor(c2 / 64), c0, sympy.Mod(c2, 64)],
             },
         ]
-        new_splits, new_tensors = align_tensors(iteration_space, tensors)
+        new_splits, new_tensors, _ = align_tensors(iteration_space, tensors)
         self.assertEqual(new_splits, iteration_space)
         self.assertEqual(
             new_tensors[0],

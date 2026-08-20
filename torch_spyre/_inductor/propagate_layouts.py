@@ -81,6 +81,7 @@ from .pass_utils import (
     device_coordinates,
     try_device_coordinates,
     indirect_info_from_op,
+    is_scaled_stick_expr,
     is_stick_expr_offset_free,
     is_topk,
     iter_var_id,
@@ -498,6 +499,20 @@ def _single_arg_op_layout(
                 return []
             if not is_stick_expr_offset_free(in_stick_expr, stl.elems_per_stick()):
                 return []
+            # A strided (step>1) sub-stick input, e.g. t[:, ::2], is
+            # offset-free (accepted above) but the backend's DDC dimension
+            # mapper cannot place its scaled stick expression directly in an
+            # ordinary op's descriptor ("Could not find any suitable
+            # dimension mapping"). Below, this forces the dense-
+            # reconstruction fallback instead of the staggered-EA fast path,
+            # so the output candidate is built from the output's own shape
+            # rather than by propagating the unrepresentable input layout.
+            # AllSameNode's edge-cost check then sees the resulting mismatch
+            # against the input's actual committed layout and schedules a
+            # restickify to materialize it first.
+            input_is_scaled_substick = is_scaled_stick_expr(
+                in_stick_expr, stl.elems_per_stick()
+            )
 
             input_ea = stl.element_arrangement
 
@@ -548,7 +563,18 @@ def _single_arg_op_layout(
             #    changing the layout rank and downstream graph partitioning.
             #    Rebuild a clean dense layout from the output host size instead,
             #    as the general (non-EA) convert path does.
-            if fmt in STAGGERED_EAS or input_ea in STAGGERED_EAS:
+            #
+            # 3. A strided (step>1) sub-stick input (see
+            #    input_is_scaled_substick above). Always take the dense-
+            #    reconstruction path for the same reason as case 2 -- the
+            #    input layout cannot be propagated/rescaled as-is -- and
+            #    downgrade fmt to STANDARD: the staggered layouts only exist
+            #    as the *output* of the up/down-cast kernel itself, so they
+            #    are not a valid tag for a dense reconstruction built from
+            #    the output's own shape.
+            if input_is_scaled_substick:
+                fmt = ElementArrangement.STANDARD
+            elif fmt in STAGGERED_EAS or input_ea in STAGGERED_EAS:
                 return [_rescale_stl_for_dtype(stl, output.dtype, fmt)]
 
             # Dense reconstruction from the output host size. When the input

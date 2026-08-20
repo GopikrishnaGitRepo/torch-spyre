@@ -458,6 +458,19 @@ TO_DTYPE_OP_MIXED_EA_BROADCAST_PARAMS_SETS = {
     for big, small in [((4, 128), (4, 1)), ((2, 4, 64), (2, 4, 1))]
 }
 
+# A strided (step>1) slice landing inside a stick, then a dtype round trip
+# that changes stick depth, e.g. t[..., ::2].to(torch.float32).to(torch.float16)
+# on a [4, 128] fp16 tensor. The slice's device coordinate is a *scaled* stick
+# expression (2*Mod(d1, 32)) that an ordinary op's DDC descriptor cannot
+# represent directly; propagate_layouts routes it through a forced restickify
+# instead of fusing the scaled layout straight through. See
+# TestScaledModStickExpr in tests/tensor/test_coordinates.py for the
+# lower-level coordinate/layout-algebra coverage this exercises.
+STRIDED_SLICE_SUB_STICK_DTYPE_CONVERT_PARAMS_SETS = {
+    shapes2key((shape,)): (cached_randn(shape),)
+    for shape in [(4, 128), (8, 256), (2, 3, 128)]
+}
+
 # M x K x N -> [M, K] @ [K, N]
 _SCALED_MM_SHAPES = [
     (128, 128, 128),
@@ -4807,6 +4820,12 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             "param_sets": TO_DTYPE_OP_PARAMS_SETS,
             "expect_fail": TO_DTYPE_OP_EXPECT_FAIL,
         },
+        (
+            "test_strided_slice_sub_stick_dtype_convert",
+            "test_strided_slice_sub_stick_dtype_convert_cpu",
+        ): {
+            "param_sets": STRIDED_SLICE_SUB_STICK_DTYPE_CONVERT_PARAMS_SETS,
+        },
         ("test_round_trip_to_dtype", "test_round_trip_to_dtype_cpu"): {
             "ops_dict": {"add": torch.add},
             "param_sets": TO_DTYPE_OP_ROUND_TRIP_PARAMS_SETS,
@@ -7316,6 +7335,17 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             fn,
             x,
             dst_dtype,
+            cpu_compile=False,
+            run_eager=False,
+        )
+
+    def test_strided_slice_sub_stick_dtype_convert_cpu(self, x):
+        def fn(t):
+            return t[..., ::2].to(torch.float32).to(torch.float16)
+
+        self.compare_with_cpu(
+            fn,
+            x,
             cpu_compile=False,
             run_eager=False,
         )

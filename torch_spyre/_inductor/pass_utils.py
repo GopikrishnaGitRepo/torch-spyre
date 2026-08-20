@@ -894,6 +894,21 @@ def is_stick_expr_offset_free(stick_expr: sympy.Expr, elems_per_stick: int) -> b
     )
 
 
+def is_scaled_stick_expr(stick_expr: sympy.Expr, elems_per_stick: int) -> bool:
+    """Check whether stick_expr is the *scaled* form ``coeff * Mod(var, N)`` with coeff > 1.
+
+    This is a strict subset of ``is_stick_expr_offset_free``: a strided
+    (step>1) sub-stick access, e.g. ``t[:, ::2]``, produces this form. It is a
+    syntactically valid, offset-free stick expression, but unlike the
+    unscaled ``Mod(var, elems_per_stick)`` case, the backend's DDC dimension
+    mapper cannot place a non-unit stride directly in an ordinary op's
+    descriptor. Callers deciding whether a candidate device layout can be
+    handed to the backend as-is (as opposed to requiring a restickify first)
+    should treat this case separately from the unscaled one.
+    """
+    return _is_scaled_mod(stick_expr, elems_per_stick)
+
+
 def _is_stick_expr_with_offset(stick_expr: sympy.Expr, elems_per_stick: int) -> bool:
     """Return True if stick_expr is an offset variant: Mod(var, N) + c or var + c."""
     if not isinstance(stick_expr, sympy.Add):

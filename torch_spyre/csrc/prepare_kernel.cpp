@@ -467,9 +467,35 @@ std::unique_ptr<JobPlanStep> JobPlanBuilder::translateComputeOnHost(
                 "': ", e.what());
   }
 
-  // Create and return JobPlanStepHostCompute
-  return std::make_unique<JobPlanStepHostCompute>(
+  // Create JobPlanStepHostCompute
+  auto step = std::make_unique<JobPlanStepHostCompute>(
       std::move(hcm_data), pinned_buffer_map_[ohandle].data(), inp_ptr, ishape);
+
+  // Attach the symbolic-input descriptors (POC: the runtime supplies the dim
+  // value S and the per-core count P at dispatch). Codegen writes
+  // symbolic_inputs.json next to bundle.mlir, which is the parent directory of
+  // spyreCodeDir. Absent for non-symbolic kernels (leaves the step unchanged).
+  auto si_path = spyrecode_dir_.parent_path() / "symbolic_inputs.json";
+  if (file_exists(si_path)) {
+    std::vector<SymbolicInput> symbolic_inputs;
+    try {
+      const auto si_json = nlohmann::json::parse(read_file_to_string(si_path));
+      for (const auto& entry : si_json.at("symbolic_inputs")) {
+        SymbolicInput si;
+        si.kind = (entry.at("kind").get<std::string>() == "percore")
+                      ? SymbolicInput::Kind::Percore
+                      : SymbolicInput::Kind::Dim;
+        si.pytorch_sym = entry.value("pytorch_sym", std::string());
+        si.split = entry.value("split", static_cast<int64_t>(0));
+        symbolic_inputs.push_back(std::move(si));
+      }
+    }
+    catch (const std::exception& e) {
+      TORCH_CHECK(false, "Failed to parse symbolic_inputs.json: ", e.what());
+    }
+    step->set_symbolic_inputs(std::move(symbolic_inputs));
+  }
+  return step;
 }
 
 std::unique_ptr<JobPlanStep> JobPlanBuilder::translateDataTransfer(

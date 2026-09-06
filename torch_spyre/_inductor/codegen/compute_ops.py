@@ -99,6 +99,11 @@ class SymbolKind:
     # Only meaningful for the kernel_derived_symbolic variant.
     core_idx: int = -1
     split_count: int = 0
+    # Per-element byte stride of the split (symbolic) dim, used by the bundle
+    # arm to form the coefficient (core_idx * per_element_stride) for the
+    # per-core address muli(P, coeff). 0 means "not available" -> the bundle
+    # falls back to the bare-constant per-core address.
+    per_element_stride: int = 0
 
     @classmethod
     def kernel(cls, arg_index: int) -> "SymbolKind":
@@ -127,13 +132,16 @@ class SymbolKind:
         split_count: int,
         base_sym_idx: int,
         pytorch_sym: str,
+        per_element_stride: int = 0,
     ) -> "SymbolKind":
         """Per-core derived address for a symbolic-dim core split.
 
-        Tags the per-core address as symbolic. The runtime formula
-        ``core_idx * ceildiv(S, split_count) * per_element_stride`` and the
-        per-element stride it needs are emitted by the bundle-arm follow-up,
-        not here, so no stride is stored on this marker.
+        Tags the per-core address as symbolic and carries the per-element byte
+        stride so the bundle arm can emit the workaround formula
+        ``addi(base, muli(P, core_idx * per_element_stride))`` where ``P`` (=
+        ceil(S/split)) is a runtime-supplied bundle input. This avoids a divide
+        op in the bundle (dxp rejects divides). ``per_element_stride == 0`` means
+        the stride was unavailable and the bundle keeps the bare-constant path.
         """
         return cls(
             kind="kernel_derived_symbolic",
@@ -142,6 +150,7 @@ class SymbolKind:
             split_count=split_count,
             base_sym_idx=base_sym_idx,
             pytorch_sym=pytorch_sym,
+            per_element_stride=per_element_stride,
         )
 
     @classmethod
@@ -802,10 +811,27 @@ def generate_sdsc(
         """
         if symbolic_split is not None:
             _sdsc_dim_name, split_count, pytorch_sym = symbolic_split
-            # TODO:  only TAG the per-core address as symbolic. The
-            # runtime arith (core * ceildiv(S, split) * per_element_stride)
-            # and the per-element stride it needs are the bundle-arm
-            # follow-up, so nothing stride-related is computed here.
+            # Byte per-element stride of the split dim, so the bundle arm can
+            # emit addi(base, muli(P, core_idx * per_element_stride)) with no
+            # divide. dim_device_strides is in ELEMENTS; multiply by nb.
+            _dds = tensor.dim_device_strides.get(Symbol(_sdsc_dim_name))
+            per_element_stride = (
+                int(_dds) * num_bytes(tensor.data_format)
+                if _dds is not None
+                else 0
+            )
+            # Self-check: the compile-time (warmup) per-core offset
+            # (addr - core0_addr) equals core_idx * P_warmup *
+            # per_element_stride, so it must be a clean multiple of
+            # (core_idx * per_element_stride). Guards a wrong stride/units.
+            if per_element_stride > 0 and c > 0:
+                _warmup_off = addr - core0_addr
+                assert _warmup_off % (c * per_element_stride) == 0, (
+                    "per-core symbolic stride check failed: warmup offset "
+                    f"{_warmup_off} is not a multiple of core_idx({c}) * "
+                    f"per_element_stride({per_element_stride}); the stride "
+                    "or its units are wrong"
+                )
             offset_as_symbol(
                 addr,
                 SymbolKind.kernel_derived_symbolic(
@@ -814,6 +840,7 @@ def generate_sdsc(
                     split_count=split_count,
                     base_sym_idx=sliced_base_sym_idx,
                     pytorch_sym=pytorch_sym,
+                    per_element_stride=per_element_stride,
                 ),
             )
         else:

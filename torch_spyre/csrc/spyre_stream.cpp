@@ -20,6 +20,7 @@
 #include <c10/core/Device.h>
 #include <c10/core/Stream.h>
 
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -301,11 +302,37 @@ void SpyreStream::launch(const JobPlan& plan,
   // then inserts the cross-stream edges. Off = every step on S_dev (the
   // single-stream floor). Routing keys on role(), so all-Dev plans never split.
   const bool should_split = get_hazard_tracker_enabled();
+  if (!perfTraceOn()) {
+    for (const auto& step : plan.steps) {
+      const SpyreStream& target =
+          (should_split && step->role() == StreamRole::Prep) ? s_prep : s_dev;
+      step->construct(ctx, target);
+    }
+    return;
+  }
+
+  // Perf trace path (SPYRE_PERF_TRACE). Time each step's host-side construct()
+  // and the whole launch. Read this carefully: H2D / Compute / D2H construct()
+  // only ENQUEUE async device ops, so their host time is tiny -- the real
+  // device work and the pipeline barriers drain later at synchronize(), which
+  // the benchmark's own compute-phase timer captures. HostCompute's callback
+  // runs SYNCHRONOUSLY inside construct(), so its host time here IS the program
+  // correction cost on the critical path. If HostCompute construct_host is ~ms,
+  // correction is the cost; if it is ~us but the dispatch is still +ms, the cost
+  // is the async launches/barriers, not the correction.
+  const auto launch_t0 = std::chrono::steady_clock::now();
+  size_t idx = 0;
   for (const auto& step : plan.steps) {
     const SpyreStream& target =
         (should_split && step->role() == StreamRole::Prep) ? s_prep : s_dev;
+    const auto step_t0 = std::chrono::steady_clock::now();
     step->construct(ctx, target);
+    std::cerr << "[SPYRE_PERF]   step[" << idx << "] " << step->kind()
+              << " construct_host=" << perfUsSince(step_t0) << "us\n";
+    ++idx;
   }
+  std::cerr << "[SPYRE_PERF] launch total_host=" << perfUsSince(launch_t0)
+            << "us steps=" << plan.steps.size() << "\n";
 }
 
 void initializeStreamPoolImpl(c10::DeviceIndex device_index) {

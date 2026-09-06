@@ -152,7 +152,17 @@ def _patch_tensor_for_spyre():
             if self.device.type != "cpu":
                 raise ValueError(TORCH_CHECK_MSG)
 
-            from torch_spyre._C import spyre_empty_reserved, copy_tensor
+            from torch_spyre._C import spyre_empty_reserved, copy_tensor, start_runtime
+
+            # This path calls into torch_spyre._C directly rather than through
+            # the torch_spyre package proxy (_SpyreImpl.__getattr__), so it
+            # never goes through _lazy_init(). Other eager ops get away with
+            # this because something earlier in the script (e.g.
+            # torch.manual_seed(), which cascades into every registered
+            # PrivateUse1 backend module) happens to trigger _lazy_init() as a
+            # side effect first. Don't rely on that here: start_runtime() is
+            # idempotent (std::call_once on the C++ side), so call it directly.
+            start_runtime()
 
             dst = spyre_empty_reserved(self.size(), self.stride(), self.dtype, 0, max)
             copy_tensor(self, dst, non_blocking=False)

@@ -19,9 +19,7 @@
 #include <sys/mman.h>
 #include <torch/types.h>
 
-#include <chrono>
 #include <cstdint>
-#include <cstdlib>
 #include <flex/flex.hpp>
 #include <iostream>
 #include <memory>
@@ -38,29 +36,6 @@ namespace spyre {
 // Forward declaration: JobPlanStep::construct() submits through SpyreStream
 // rather than the raw flex::RuntimeStream handle.
 class SpyreStream;
-
-// -------------------------------------------------------------------------
-// Perf tracing (opt-in via SPYRE_PERF_TRACE). Lightweight steady_clock probes
-// on the dispatch path so we can see WHERE symbolic-shape dispatch spends its
-// time: the host-side program correction (synchronous, on the critical path)
-// versus the async device launches and pipeline barriers that only drain later
-// at synchronize(). Off unless SPYRE_PERF_TRACE is set to a non-empty, non-"0"
-// value. Emits to std::cerr with a "[SPYRE_PERF]" prefix so it is greppable and
-// does not interleave with the benchmark's stdout.
-// -------------------------------------------------------------------------
-inline bool perfTraceOn() {
-  static const bool on = []() {
-    const char* e = std::getenv("SPYRE_PERF_TRACE");
-    return e != nullptr && e[0] != '\0' && e[0] != '0';
-  }();
-  return on;
-}
-
-inline double perfUsSince(std::chrono::steady_clock::time_point t0) {
-  return std::chrono::duration<double, std::micro>(
-             std::chrono::steady_clock::now() - t0)
-      .count();
-}
 
 /**
  * @brief RAII wrapper for page-aligned and pinned host memory
@@ -342,13 +317,6 @@ class JobPlanStep {
   virtual void write(std::ostream& os) const = 0;
 
   /**
-   * @brief Short step-kind label, used only by SPYRE_PERF_TRACE output.
-   */
-  virtual const char* kind() const {
-    return "Step";
-  }
-
-  /**
    * @brief Enable or disable pipeline barrier for this step
    *
    * Pipeline barriers control operation ordering within a stream. When enabled,
@@ -432,10 +400,6 @@ class JobPlanStepH2D final : public JobPlanStep {
 
   void construct(LaunchContext& ctx, const SpyreStream& stream) const override;
 
-  const char* kind() const override {
-    return "H2D";
-  }
-
   void write(std::ostream& os) const override;
 
  private:
@@ -484,10 +448,6 @@ class JobPlanStepD2H final : public JobPlanStep {
 
   void construct(LaunchContext& ctx, const SpyreStream& stream) const override;
 
-  const char* kind() const override {
-    return "D2H";
-  }
-
   void write(std::ostream& os) const override;
 
  private:
@@ -535,10 +495,6 @@ class JobPlanStepCompute final : public JobPlanStep {
 
   void construct(LaunchContext& ctx, const SpyreStream& stream) const override;
 
-  const char* kind() const override {
-    return "Compute";
-  }
-
   void write(std::ostream& os) const override;
 
  private:
@@ -546,20 +502,6 @@ class JobPlanStepCompute final : public JobPlanStep {
   bool bind_io_addresses_;
   uint64_t bootstrap_offset_;
   std::string name_;
-};
-
-/**
- * @brief Descriptor for one extra runtime input the bundle expects beyond the
- * tensor base addresses: either a symbolic dim value S, or a per-core count
- * P = ceil(S / split). The list is ordered to match the bundle.mlir func-param
- * order (all dims first, then all per-core counts). Emitted by codegen into
- * symbolic_inputs.json and consumed at dispatch by JobPlanStepHostCompute.
- */
-struct SymbolicInput {
-  enum class Kind { Dim, Percore };
-  Kind kind;
-  std::string pytorch_sym;
-  int64_t split = 0;  // number of cores the dim is split across; Percore only
 };
 
 /**
@@ -615,18 +557,7 @@ class JobPlanStepHostCompute final : public JobPlanStep {
 
   void construct(LaunchContext& ctx, const SpyreStream& stream) const override;
 
-  const char* kind() const override {
-    return "HostCompute";
-  }
-
   void write(std::ostream& os) const override;
-
-  /// Attach the symbolic-input descriptors (S / P slots) parsed from
-  /// symbolic_inputs.json. When non-empty, construct() forwards the runtime
-  /// dim value(s) and per-core count(s) to program correction.
-  void set_symbolic_inputs(std::vector<SymbolicInput> symbolic_inputs) {
-    symbolic_inputs_ = std::move(symbolic_inputs);
-  }
 
   /**
    * @brief Resolve a symbolic_args payload to a vector of int64 values.
@@ -655,7 +586,6 @@ class JobPlanStepHostCompute final : public JobPlanStep {
   void* output_buffer_;       // Non-owning pointer (JobPlan owns the buffer)
   const void* input_buffer_;  // Non-owning pointer (JobPlan owns the buffer)
   std::vector<int64_t> ishape_;
-  std::vector<SymbolicInput> symbolic_inputs_;
 
   // Pre-compiled patch plan for fast execution
   mutable deeptools::FastHcmPatchPlan fast_plan_;

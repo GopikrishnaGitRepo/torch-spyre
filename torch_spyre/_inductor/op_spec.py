@@ -357,6 +357,15 @@ class LoopSpec:
         count: Trip count of the loop. May be a symbolic shape expression.
         body: The operations to execute each iteration. Each element may be
             an OpSpec, UnimplementedOp, or a nested LoopSpec.
+        count_bounds: (max_value, granularity) for ``count`` when it is
+            symbolic; ``None`` for a concrete (int/sympy.Integer) count.
+            Required whenever ``count`` carries free symbols -- bundle
+            codegen has no live ShapeEnv to derive this from at emission
+            time (generate_bundle runs after specs are serialized for async
+            compile), so the bound must be computed up front, while the
+            symbol's ShapeEnv range is still available, and carried here as
+            plain data. Mirrors ``OpSpec.symbolic_dim_bounds`` but scoped to
+            one loop's count rather than a whole dict of dims.
 
     Each OpSpec in the body carries its own ``tiled_symbols`` list identifying
     which of its iteration-space symbols are tiled by the loop that directly
@@ -369,6 +378,7 @@ class LoopSpec:
     # list[OpSpec | UnimplementedOp | LoopSpec], typed as Any to accommodate
     # the two distinct UnimplementedOp types (op_spec vs spyre_kernel).
     body: list[Any]
+    count_bounds: tuple[int, int] | None = None
 
 
 def spyre_constant_tensor(const_val, device, dtype=torch.float16):

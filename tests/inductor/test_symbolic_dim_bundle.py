@@ -22,6 +22,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
+import sympy
 from torch._inductor.test_case import TestCase as InductorTestCase
 
 from torch_spyre._inductor import config
@@ -31,7 +32,7 @@ from torch_spyre._inductor.codegen.bundle import (
 )
 from torch_spyre._inductor.codegen.compute_ops import SymbolKind
 from torch_spyre._inductor.constants import MAX_POOL_SIZE_BYTES
-from torch_spyre._inductor.op_spec import OpSpec
+from torch_spyre._inductor.op_spec import LoopSpec, OpSpec
 
 
 class TestFrontendPoolAllocationConfig(unittest.TestCase):
@@ -473,3 +474,102 @@ class TestGenerateBundleDimensionSymbols(InductorTestCase):
             f"%pool = sdscbundle.device_mem_allocate {MAX_POOL_SIZE_BYTES} bytes : index",
             bundle,
         )
+
+
+class TestGenerateBundleSymbolicLoopCount(InductorTestCase):
+    """Symbolic LoopSpec.count support (Symbolic Shapes HLD, Track A1).
+
+    generate_bundle has no live ShapeEnv (specs are serialized for async
+    compile before this runs), so a symbolic count's (max_value,
+    granularity) must arrive pre-computed on LoopSpec.count_bounds. These
+    tests build the LoopSpec directly rather than through a real
+    mark_dynamic compile, mirroring TestGenerateBundleDimensionSymbols
+    above.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self.output_dir = self._tmpdir.name
+
+    def tearDown(self):
+        self._tmpdir.cleanup()
+        super().tearDown()
+
+    def _read_bundle(self) -> str:
+        with open(os.path.join(self.output_dir, "bundle.mlir")) as f:
+            return f.read()
+
+    def _run_bundle(self, compiled_entries, op_specs, pool_size=0):
+        side_effects = [e for entry in compiled_entries for e in (entry, entry)]
+        with patch(
+            "torch_spyre._inductor.codegen.bundle.compile_op_spec",
+            side_effect=side_effects,
+        ):
+            generate_bundle("test", self.output_dir, op_specs, pool_size=pool_size)
+        return self._read_bundle()
+
+    def _symbolic_loop_spec(self, count_bounds=(16, 1)):
+        entry = (_make_sdsc_json(dim_sym_ids={"mb": [-1]}), [0], [], [])
+        s0 = sympy.Symbol("s0")
+        loop_spec = LoopSpec(
+            count=sympy.ceiling(s0 / 64),
+            body=[_minimal_op_spec()],
+            count_bounds=count_bounds,
+        )
+        return entry, loop_spec
+
+    def test_symbolic_count_function_signature(self):
+        """A symbolic LoopSpec.count produces an input_arg param, not a constant."""
+        entry, loop_spec = self._symbolic_loop_spec(count_bounds=(16, 1))
+
+        bundle = self._run_bundle([entry], [loop_spec])
+
+        self.assertIn(
+            "%loop_bound_0_base: !sdscbundle.input_arg<index, granularity=1,"
+            " max_value=16>",
+            bundle,
+        )
+
+    def test_symbolic_count_extract_op(self):
+        """input_arg_extract unpacks the base param into plain index %loop_bound_0."""
+        entry, loop_spec = self._symbolic_loop_spec(count_bounds=(16, 1))
+
+        bundle = self._run_bundle([entry], [loop_spec])
+
+        self.assertIn(
+            "%loop_bound_0 = sdscbundle.input_arg_extract value from"
+            " %loop_bound_0_base : !sdscbundle.input_arg<index, granularity=1,"
+            " max_value=16> -> index",
+            bundle,
+        )
+        # No arith.constant should back this loop bound.
+        self.assertNotIn("%loop_bound_0 = arith.constant", bundle)
+
+    def test_symbolic_count_scf_for_bound_unchanged(self):
+        """scf.for still references %loop_bound_0 regardless of its source."""
+        entry, loop_spec = self._symbolic_loop_spec(count_bounds=(16, 1))
+
+        bundle = self._run_bundle([entry], [loop_spec])
+
+        self.assertIn(
+            "scf.for %i_0 = %c0 to %loop_bound_0 step %c1 {",
+            bundle,
+        )
+
+    def test_concrete_count_unaffected(self):
+        """A concrete LoopSpec.count still emits the plain arith.constant path."""
+        entry = (_make_sdsc_json(dim_sym_ids={"mb": [-1]}), [0], [], [])
+        loop_spec = LoopSpec(count=sympy.Integer(4), body=[_minimal_op_spec()])
+
+        bundle = self._run_bundle([entry], [loop_spec])
+
+        self.assertIn("%loop_bound_0 = arith.constant 4 : index", bundle)
+        self.assertNotIn("input_arg_extract value from %loop_bound_0_base", bundle)
+
+    def test_symbolic_count_without_bounds_raises(self):
+        """A symbolic count with no count_bounds fails loudly, not silently."""
+        entry, loop_spec = self._symbolic_loop_spec(count_bounds=None)
+
+        with self.assertRaises(NotImplementedError):
+            self._run_bundle([entry], [loop_spec])

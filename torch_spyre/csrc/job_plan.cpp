@@ -16,7 +16,6 @@
 
 #include "job_plan.h"
 
-#include <chrono>
 #include <iostream>
 #include <memory>
 #include <string>
@@ -27,7 +26,6 @@
 #include "spyre_allocator.h"
 #include "spyre_composite_address.h"
 #include "spyre_stream.h"
-#include "spyre_tensor_impl.h"
 #include "spyrecode-host-functions/processSpyreCodeArtifacts.h"
 
 namespace spyre {
@@ -181,66 +179,6 @@ void JobPlanStepHostCompute::construct(LaunchContext& ctx,
     } guard{params};
     stream.launchHostCallback(params);
   };
-
-  // Symbolic-shape dispatch (POC): the bundle declares extra input_arg slots
-  // after the tensor base addresses -- the runtime dim value S and the per-core
-  // count P = ceil(S / split). Build [base DMVAs...] + [S / P ...] in the order
-  // codegen recorded (dims first, then per-core) and hand it to program
-  // correction. This forces the address-forwarding path regardless of which
-  // host-compute case would otherwise apply (the fake-symbol {0} path and the
-  // extract-addresses path), and clears the DataConvertInfo input-count check
-  // that expects one value per bundle func param. Guarded on a null
-  // input_buffer_ so a real Case-1 pinned-buffer correction is never overridden
-  // (the symbolic per-core correction always has input_buffer_ == nullptr).
-  if (!symbolic_inputs_.empty() && input_buffer_ == nullptr) {
-    const bool trace = perfTraceOn();
-    const auto build_t0 = std::chrono::steady_clock::now();
-    std::vector<int64_t> addresses;
-    addresses.reserve(ctx.inputs_outputs.size() + symbolic_inputs_.size());
-    auto& allocator = SpyreAllocator::instance();
-    for (auto& tensor : ctx.inputs_outputs) {
-      addresses.push_back(allocator.compositeAddressToDmva(
-          (static_cast<SharedOwnerCtx*>(tensor.storage().data_ptr().get_context())
-               ->composite_addr)));
-    }
-    // Runtime symbolic size S from the max-reserved tensor: tensor.to("spyre",
-    // max=N) records the symbolic dim index in reserved_dim, and resize_ keeps
-    // the logical size at the concrete runtime value. POC assumes a single
-    // symbolic dim, so one reserved tensor supplies S for every symbolic slot.
-    int64_t s_val = -1;
-    for (auto& tensor : ctx.inputs_outputs) {
-      auto* impl = static_cast<SpyreTensorImpl*>(tensor.unsafeGetTensorImpl());
-      if (impl->reserved_dim.has_value()) {
-        s_val = tensor.size(*impl->reserved_dim);
-        break;
-      }
-    }
-    TORCH_CHECK(s_val >= 0,
-                "symbolic dispatch: no max-reserved tensor found; the symbolic "
-                "input must be created via tensor.to(\"spyre\", max=N)");
-    for (const auto& si : symbolic_inputs_) {
-      if (si.kind == SymbolicInput::Kind::Percore) {
-        TORCH_CHECK(si.split > 0, "symbolic dispatch: invalid split ", si.split);
-        addresses.push_back((s_val + si.split - 1) / si.split);  // ceil(S/split)
-      } else {
-        addresses.push_back(s_val);  // the symbolic dim value S
-      }
-    }
-    if (trace) {
-      std::cerr << "[SPYRE_PERF] hostcompute.symbolic addr_build="
-                << perfUsSince(build_t0) << "us S=" << s_val
-                << " n_addr=" << addresses.size() << "\n";
-    }
-    launch_host_callback([this, addresses, trace](void*) {
-      const auto corr_t0 = std::chrono::steady_clock::now();
-      deeptools::processComputeOnHostCommand(*hcm_, output_buffer_, &addresses);
-      if (trace) {
-        std::cerr << "[SPYRE_PERF] hostcompute.symbolic correction_callback="
-                  << perfUsSince(corr_t0) << "us\n";
-      }
-    });
-    return;
-  }
 
   // Case 1: input_buffer_ is provided
   if (input_buffer_ != nullptr) {

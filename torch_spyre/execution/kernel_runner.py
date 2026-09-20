@@ -129,6 +129,12 @@ class SpyreSDSCKernelRunner:
 
     @property
     def jobplan(self):
+        if self._specs is not None:
+            raise RuntimeError(
+                f"{self.kernel_name} has a symbolic loop count and no jobplan of "
+                "its own; launch it as run(..., loop_count=n) so the variant for "
+                "n is compiled, and take that runner's jobplan"
+            )
         if self.code_dir is None:
             raise RuntimeError(f"{self.kernel_name} has no concrete code directory")
         if self._jobplan is None:

@@ -494,3 +494,32 @@ def test_variant_runner_single_flight_for_concurrent_same_count():
     assert not errors
     assert results == [concrete, concrete]
     compile_call.assert_called_once()
+
+
+def test_symbolic_runner_has_no_jobplan_of_its_own():
+    """A symbolic runner owns no compiled code, only the specs to specialize.
+
+    Reading .jobplan on one is a caller that skipped run(loop_count=...); say so,
+    rather than reporting a missing code directory as if compilation had failed.
+    """
+    count = sympy.Symbol("s0", integer=True, positive=True)
+    runner = SpyreSDSCKernelRunner(
+        "dynamic",
+        None,
+        specs=[LoopSpec(count=count, body=[], max_count=8)],
+    )
+
+    with pytest.raises(RuntimeError, match="symbolic loop count"):
+        runner.jobplan
+
+
+def test_run_rejects_an_unexpected_keyword_argument():
+    """Launch args are positional and index-bound to the op specs.
+
+    A keyword arriving here is a generated-wrapper/runner mismatch; absorbing it
+    would drop a real argument silently.
+    """
+    runner = SpyreSDSCKernelRunner("concrete", None)
+
+    with pytest.raises(TypeError, match="unexpected keyword argument 'stream'"):
+        runner.run(object(), stream=0)

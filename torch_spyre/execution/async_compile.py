@@ -33,7 +33,9 @@ from torch_spyre._inductor.op_spec import (
     LoopSpec,
     OpSpec,
     UnimplementedOp,
+    distinct_symbolic_counts,
     find_unimplemented,
+    iter_loop_specs,
 )
 from torch_spyre._inductor.kernel_provenance import (
     build_kernel_provenance_descriptor,
@@ -63,13 +65,7 @@ _COMPILE_TIMEOUT_S = 60.0
 
 
 def _symbolic_loop_counts(specs) -> list[LoopSpec]:
-    loops = []
-    for spec in specs:
-        if isinstance(spec, LoopSpec):
-            if spec.count.free_symbols:
-                loops.append(spec)
-            loops.extend(_symbolic_loop_counts(spec.body))
-    return loops
+    return [loop for loop in iter_loop_specs(specs) if loop.count.free_symbols]
 
 
 def specialize_loop_count(specs, loop_count: int):
@@ -81,11 +77,15 @@ def specialize_loop_count(specs, loop_count: int):
     def specialize(spec):
         if not isinstance(spec, LoopSpec):
             return spec
-        count = sympy.Integer(loop_count) if spec.count.free_symbols else spec.count
-        if spec.max_count is not None and loop_count > spec.max_count:
-            raise ValueError(
-                f"loop_count {loop_count} exceeds traced maximum {spec.max_count}"
-            )
+        count = spec.count
+        if count.free_symbols:
+            # Only a symbolic count is bound to loop_count; a concrete nested
+            # loop keeps its own trip count and is not bounded by max_count.
+            if spec.max_count is not None and loop_count > spec.max_count:
+                raise ValueError(
+                    f"loop_count {loop_count} exceeds traced maximum {spec.max_count}"
+                )
+            count = sympy.Integer(loop_count)
         return LoopSpec(
             count=count,
             body=[specialize(item) for item in spec.body],
@@ -452,7 +452,7 @@ class SpyreAsyncCompile(AsyncCompile):
 
         symbolic_loops = _symbolic_loop_counts(finalized_specs)
         if symbolic_loops:
-            counts = {loop.count for loop in symbolic_loops}
+            counts = distinct_symbolic_counts(finalized_specs)
             if len(counts) != 1:
                 raise ValueError(
                     "one kernel cannot yet contain independently dynamic "

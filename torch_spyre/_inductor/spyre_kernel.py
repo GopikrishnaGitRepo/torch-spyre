@@ -83,6 +83,7 @@ from .op_spec import (
     TensorArg,
     TensorWorkDivision,
     UnimplementedOp as OpSpecUnimplementedOp,
+    distinct_symbolic_counts,
     format_op_spec_list,
     is_lx_relayout_identity,
 )
@@ -1488,18 +1489,14 @@ class SpyreKernel(Kernel[CSEVariable]):
         )
         call_args.extend(self._live_call_arg_names)
 
-        symbolic_counts = {
-            V.graph.sizevars.simplify(loop.count)
-            for loop in _iter_loop_specs(self.op_specs)
-            if loop.count.free_symbols
-        }
+        symbolic_counts = distinct_symbolic_counts(self.op_specs)
         if len(symbolic_counts) > 1:
             raise Unsupported(
                 "one Spyre kernel cannot yet contain independently dynamic "
                 f"loop counts: {sorted(map(str, symbolic_counts))}"
             )
         if symbolic_counts:
-            count = next(iter(symbolic_counts))
+            count = V.graph.sizevars.simplify(symbolic_counts[0])
             for symbol in count.free_symbols:
                 wrapper.ensure_size_computed(symbol)
             call_args.append(f"loop_count={wrapper.codegen_sizevar(count)}")
@@ -1569,13 +1566,6 @@ def _iter_op_specs(specs):
             yield from _iter_op_specs(item.body)
         elif isinstance(item, OpSpec):
             yield item
-
-
-def _iter_loop_specs(specs):
-    for item in specs:
-        if isinstance(item, LoopSpec):
-            yield item
-            yield from _iter_loop_specs(item.body)
 
 
 def uses_hbm_pool(specs) -> bool:

@@ -13,7 +13,7 @@
 # limitations under the License.
 
 import threading
-from concurrent.futures import Future
+from concurrent.futures import Future, TimeoutError as FuturesTimeoutError
 
 import torch
 from torch_spyre._C import (
@@ -58,6 +58,12 @@ class SpyreSDSCKernelRunner:
     This avoids calling ``prepare_kernel`` (which requires a live C++
     RuntimeContext) in the compiling process; the context is only guaranteed
     to be available on the process that actually launches the kernel.
+
+    Everything lazily derived here -- the jobplan, the per-count variant
+    runners, and the locks guarding both -- is process-local: a jobplan binds to
+    one process's RuntimeContext and a lock cannot cross a fork or a pickle at
+    all. Pickling therefore carries only the identity (name, code dir, specs,
+    provenance), and the receiving process re-derives the rest on first use.
     """
 
     def __init__(
@@ -78,6 +84,7 @@ class SpyreSDSCKernelRunner:
         )
         self.profiler_event_name: str | None
         self._jobplan = None  # initialised lazily, not pickled
+        self._jobplan_lock = threading.Lock()
         self._specs = specs
         self._pool_size = pool_size
         self._variant_lock = threading.Lock()
@@ -137,25 +144,35 @@ class SpyreSDSCKernelRunner:
             )
         if self.code_dir is None:
             raise RuntimeError(f"{self.kernel_name} has no concrete code directory")
-        if self._jobplan is None:
-            logger.debug(
-                "Initialising jobplan for %s from %s", self.kernel_name, self.code_dir
-            )
-            # _lazy_init() ensures the C++ RuntimeContext is initialised before
-            # prepare_kernel(), which calls into JobPlanBuilder/getDefaultStream().
-            torch.spyre._impl._lazy_init()
-            spyrecode_dir = self.code_dir + "/spyreCodeDir"
-            if self.profiler_event_name is None:
-                self._jobplan = prepare_kernel(spyrecode_dir)
-            else:
-                with torch.profiler.record_function(
-                    f"prepare_kernel:{self.kernel_name}"
-                ):
-                    self._jobplan = prepare_kernel(
-                        spyrecode_dir,
-                        profiler_name=self.profiler_event_name,
-                    )
-        return self._jobplan
+        if self._jobplan is not None:
+            return self._jobplan
+        # Single-flight: prepare_kernel builds device-side state, so two threads
+        # first launching the same kernel must not each build their own. The lock
+        # is never held together with _variant_lock -- a variant runner is a
+        # different object with its own jobplan -- so the two cannot deadlock.
+        with self._jobplan_lock:
+            if self._jobplan is None:
+                logger.debug(
+                    "Initialising jobplan for %s from %s",
+                    self.kernel_name,
+                    self.code_dir,
+                )
+                # _lazy_init() ensures the C++ RuntimeContext is initialised
+                # before prepare_kernel(), which calls into
+                # JobPlanBuilder/getDefaultStream().
+                torch.spyre._impl._lazy_init()
+                spyrecode_dir = self.code_dir + "/spyreCodeDir"
+                if self.profiler_event_name is None:
+                    self._jobplan = prepare_kernel(spyrecode_dir)
+                else:
+                    with torch.profiler.record_function(
+                        f"prepare_kernel:{self.kernel_name}"
+                    ):
+                        self._jobplan = prepare_kernel(
+                            spyrecode_dir,
+                            profiler_name=self.profiler_event_name,
+                        )
+            return self._jobplan
 
     def _variant_runner(self, loop_count: int):
         if isinstance(loop_count, bool) or not isinstance(loop_count, int):
@@ -172,13 +189,14 @@ class SpyreSDSCKernelRunner:
             else:
                 owner = False
 
+        from torch_spyre.execution.async_compile import (
+            SpyreAsyncCompile,
+            specialize_loop_count,
+            variant_wait_timeout_s,
+        )
+
         if owner:
             try:
-                from torch_spyre.execution.async_compile import (
-                    SpyreAsyncCompile,
-                    specialize_loop_count,
-                )
-
                 compiler = SpyreAsyncCompile()
                 specs = specialize_loop_count(self._specs, loop_count)
                 runner = compiler._sdsc_concrete(
@@ -196,11 +214,29 @@ class SpyreSDSCKernelRunner:
                     if self._variant_futures.get(loop_count) is future:
                         del self._variant_futures[loop_count]
                 raise
-        return future.result()
+            # A failed compile is retryable: the future was evicted above, so the
+            # next dispatch of this count owns a fresh one.
+            return future.result()
+
+        # Only a non-owner waits, and it is bounded: if the owning thread dies
+        # without resolving the future, an unbounded wait would hang the engine
+        # with nothing to report. The future is deliberately left in place -- the
+        # owner may still be making progress, and evicting it here would start a
+        # duplicate compile of the same count.
+        timeout = variant_wait_timeout_s()
+        try:
+            return future.result(timeout=timeout)
+        except FuturesTimeoutError as exc:
+            raise RuntimeError(
+                f"{self.kernel_name}: waited {timeout}s for another thread to "
+                f"compile the loop_count={loop_count} variant; raise or disable "
+                "the bound with SPYRE_BACKEND_COMPILE_TIMEOUT_S (0 disables it)"
+            ) from exc
 
     def __getstate__(self):
         state = self.__dict__.copy()
         state["_jobplan"] = None
+        state["_jobplan_lock"] = None
         state["_variant_lock"] = None
         state["_variant_futures"] = {}
         return state
@@ -208,6 +244,7 @@ class SpyreSDSCKernelRunner:
     def __setstate__(self, state):
         self.__dict__.update(state)
         self._jobplan = None
+        self._jobplan_lock = threading.Lock()
         self._variant_lock = threading.Lock()
         self._variant_futures = {}
 

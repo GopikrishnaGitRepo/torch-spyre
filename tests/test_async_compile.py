@@ -17,7 +17,11 @@
 from concurrent.futures import Future
 import os
 from pathlib import Path
+import pickle
+import subprocess
+import sys
 import threading
+import time
 from typing import Any
 from unittest.mock import patch
 
@@ -31,6 +35,7 @@ from torch_spyre._inductor import config as spyre_config
 from torch_spyre._inductor.codegen.compute_ops import SymbolKind
 from torch_spyre.execution import async_compile as async_compile_mod
 from torch_spyre._inductor.op_spec import LoopSpec
+from torch_spyre.execution import kernel_runner as kernel_runner_mod
 from torch_spyre.execution.kernel_runner import SpyreSDSCKernelRunner
 
 
@@ -511,6 +516,155 @@ def test_symbolic_runner_has_no_jobplan_of_its_own():
 
     with pytest.raises(RuntimeError, match="symbolic loop count"):
         runner.jobplan
+
+
+def test_jobplan_is_prepared_once_for_concurrent_first_launches():
+    """prepare_kernel builds device-side state, so two threads must not both run it.
+
+    The first launch of a kernel is exactly when two engine threads can arrive
+    together, and a second JobPlan for the same code dir is a leak at best.
+    """
+    runner = SpyreSDSCKernelRunner("concrete", "/tmp/nonexistent-code-dir")
+    plan = object()
+    entered = threading.Event()
+    release = threading.Event()
+
+    def prepare_kernel(_spyrecode_dir):
+        entered.set()
+        assert release.wait(timeout=10)
+        return plan
+
+    results = []
+    errors = []
+
+    def request():
+        try:
+            results.append(runner.jobplan)
+        except BaseException as exc:  # pragma: no cover - diagnostic path
+            errors.append(exc)
+
+    with (
+        patch.object(torch.spyre._impl, "_lazy_init"),
+        patch.object(
+            kernel_runner_mod, "prepare_kernel", side_effect=prepare_kernel
+        ) as prepare,
+    ):
+        first = threading.Thread(target=request)
+        second = threading.Thread(target=request)
+        first.start()
+        assert entered.wait(timeout=10)
+        second.start()
+        release.set()
+        first.join(timeout=10)
+        second.join(timeout=10)
+
+    assert not errors
+    assert results == [plan, plan]
+    prepare.assert_called_once()
+
+
+def test_ktir_rejects_a_symbolic_loop_count_before_emitting():
+    """The KTIR emitter has no per-count variant path, so say so up front.
+
+    Failing here, rather than inside codegen, names both the emitter and the flag
+    that selected it, and leaves no half-written artifact behind.
+    """
+    compiler = async_compile_mod.SpyreAsyncCompile()
+    count = sympy.Symbol("s0", integer=True, positive=True)
+    specs = [LoopSpec(count=count, body=[], max_count=8)]
+
+    with (
+        patch.object(async_compile_mod, "_check_ktir_device_prerequisites") as check,
+        patch.object(async_compile_mod, "get_output_dir") as output_dir,
+    ):
+        with pytest.raises(NotImplementedError, match="TORCH_SPYRE_KTIR=0"):
+            compiler.ktir("dynamic", specs)
+
+    check.assert_not_called()
+    output_dir.assert_not_called()
+
+
+def test_compile_timeout_env_overrides_the_stage_default():
+    with patch.dict(os.environ):
+        os.environ.pop(async_compile_mod._TIMEOUT_ENV, None)
+        assert async_compile_mod.compile_timeout_s(30.0) == 30.0
+
+    with patch.dict(os.environ, {async_compile_mod._TIMEOUT_ENV: "5"}):
+        assert async_compile_mod.compile_timeout_s(30.0) == 5.0
+
+    with patch.dict(os.environ, {async_compile_mod._TIMEOUT_ENV: "0"}):
+        assert async_compile_mod.compile_timeout_s(30.0) is None
+        assert async_compile_mod.variant_wait_timeout_s() is None
+
+    with patch.dict(os.environ, {async_compile_mod._TIMEOUT_ENV: "soon"}):
+        with pytest.raises(ValueError, match="is not a number"):
+            async_compile_mod.compile_timeout_s(30.0)
+
+
+def test_variant_wait_outlasts_the_compile_it_waits_for():
+    """A waiter that gives up first would report a hang the compiler is not in."""
+    with patch.dict(os.environ, {async_compile_mod._TIMEOUT_ENV: "5"}):
+        wait = async_compile_mod.variant_wait_timeout_s()
+        compile_bound = async_compile_mod.compile_timeout_s(
+            async_compile_mod._COMPILE_TIMEOUT_S
+        )
+
+    assert wait is not None and compile_bound is not None
+    assert wait > compile_bound
+
+
+def test_run_reaped_kills_grandchildren_on_timeout(tmp_path):
+    """Killing only the child leaves the compiler's own children holding the card."""
+    pid_file = tmp_path / "grandchild.pid"
+    script = (
+        "import subprocess, sys, time\n"
+        "child = subprocess.Popen([sys.executable, '-c', 'import time;"
+        " time.sleep(60)'])\n"
+        f"open({str(pid_file)!r}, 'w').write(str(child.pid))\n"
+        "time.sleep(60)\n"
+    )
+
+    with pytest.raises(subprocess.TimeoutExpired):
+        async_compile_mod._run_reaped([sys.executable, "-c", script], timeout=2.0)
+
+    grandchild = int(pid_file.read_text())
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        try:
+            os.kill(grandchild, 0)
+        except ProcessLookupError:
+            return
+        time.sleep(0.05)
+    pytest.fail(f"grandchild {grandchild} survived the timeout")
+
+
+def test_pickled_symbolic_runner_recompiles_its_variants():
+    """Compiled variants, jobplans and locks are process-local by construction.
+
+    A runner crosses a process boundary as identity only; the receiver rebuilds
+    what binds to its own RuntimeContext.
+    """
+    count = sympy.Symbol("s0", integer=True, positive=True)
+    runner = SpyreSDSCKernelRunner(
+        "dynamic",
+        None,
+        specs=[LoopSpec(count=count, body=[], max_count=8)],
+    )
+    concrete = object()
+    compiler = async_compile_mod.SpyreAsyncCompile()
+
+    with (
+        patch.object(async_compile_mod, "SpyreAsyncCompile", return_value=compiler),
+        patch.object(compiler, "_sdsc_concrete", return_value=concrete) as compile_one,
+    ):
+        assert runner._variant_runner(3) is concrete
+        copy = pickle.loads(pickle.dumps(runner))
+        assert copy._variant_futures == {}
+        assert copy._jobplan is None
+        assert copy._jobplan_lock is not None
+        assert copy._variant_runner(3) is concrete
+
+    assert compile_one.call_count == 2
 
 
 def test_run_rejects_an_unexpected_keyword_argument():

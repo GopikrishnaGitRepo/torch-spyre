@@ -3277,9 +3277,10 @@ def splice_while_loops(graph) -> None:
         for while_op in while_ops:
             loop_name = getattr(while_op, "get_name", lambda: repr(while_op))()
             result = try_prove_for_each_tile(while_op)
-            if not result.accepted:
+            if not result.accepted or result.trip_count is None:
                 declined.append(f"{loop_name}: {result.reason}")
                 continue
+            trip_count = result.trip_count
 
             loop_var = _body_loop_var(while_op)
             if loop_var is None:
@@ -3300,25 +3301,22 @@ def splice_while_loops(graph) -> None:
                 getattr(while_op, "_for_each_tile_ancestor_level_indices", ())
             )
 
-            stacking = _stacking_carry_indices(while_op, loop_var, result.trip_count)
-            if stacking and result.trip_count.free_symbols:
+            stacking = _stacking_carry_indices(while_op, loop_var, trip_count)
+            if stacking and trip_count.free_symbols:
                 # The stacked output's layout is planned from the trip count, so
                 # a symbolic one would size it from the planning extent while a
                 # smaller runtime count writes only a prefix, leaving the tail
                 # uninitialized. Map mode with a concrete count is unaffected.
                 declined.append(
-                    f"{loop_name}: trip count {result.trip_count} is symbolic and "
-                    f"this loop stacks its output through carries {sorted(stacking)}"
+                    f"{loop_name}: trip count {trip_count} is symbolic and this "
+                    f"loop stacks its output through carries {sorted(stacking)}"
                 )
                 continue
 
             carries = carry_bindings_for(while_op, stacking)
             names_before_splice = {op.get_name() for op in graph.operations}
             group_ops = splice_while_loop(
-                graph,
-                while_op,
-                carries,
-                trip_count=result.trip_count,
+                graph, while_op, carries, trip_count=trip_count
             )
             # The splice can also add an op OUTSIDE this loop's body: a
             # carry's pre-loop ownership copy. It runs once per trip of every
@@ -3353,7 +3351,7 @@ def splice_while_loops(graph) -> None:
             pending_levels.append(
                 (
                     loop_var,
-                    result.trip_count,
+                    trip_count,
                     group_idx,
                     recordable_names,
                 )

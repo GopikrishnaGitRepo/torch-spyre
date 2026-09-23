@@ -997,8 +997,9 @@ at::Tensor spyre_empty_reserved(c10::IntArrayRef size, c10::IntArrayRef stride,
   spyre_tensor_impl->dma_strides = stride.vec();
   spyre_tensor_impl->reserved_dim = dim;
   spyre_tensor_impl->reserved_max = max_size;
-  DEBUGINFO("SpyreTensorLayout (reserved dim=", dim, " max=", max_size,
-            "): ", device_layout.toString());
+  SPYRE_RUNTIME_DEBUG() << "SpyreTensorLayout (reserved dim=" << dim
+                        << " max=" << max_size
+                        << "): " << device_layout.toString();
   return tensor;
 }
 

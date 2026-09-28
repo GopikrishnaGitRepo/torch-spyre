@@ -161,7 +161,7 @@ It exercises the whole path, the bridge, the loop production, the SDSC and bundl
 
 ### 5.3 Phase 2, where the varying axis is a reduction axis
 
-Adds SDPA and the Phase 1 ops on the sequence axis. Sequence length varies per request, and padding it is the dominant waste because attention cost grows with the square of the padded length. [CoRa](https://arxiv.org/abs/2110.10221) measures a 1.6x geomean speedup on a transformer encoder purely from removing that padding.
+Adds SDPA and the Phase 1 ops on the sequence axis. Sequence length varies per request, and padding it is the dominant waste because attention cost grows with the square of the padded length.
 
 Technically much deeper. The sequence sits on both axes of the score matrix and on the softmax reduction, so it is a reduction axis and a tiling axis at the same time. Online softmax then carries two running values, not one, and needs a second pass to normalise. The sequence also sits under the batch dimension, so the batch stride depends on it, which brings in the nested allocation question. And the attention decomposition currently divides the sequence by a block size as a plain integer, which has to become symbolic.
 
@@ -174,20 +174,9 @@ A runtime varying value can land in exactly five places, and each has a fixed an
 | Outer extent | how many independent pieces of work exist along an axis | **supported, Phase 1** | becomes the loop trip count, the one place a symbol is cheap |
 | Reduction extent | how many values fold together into one | **Phase 2** | needs a carry across iterations, a defined pad, and the true length as data |
 | Index or table length | the length of an index tensor, or the table it reads | **separate track**, ref [#4382](https://github.com/torch-spyre/torch-spyre/issues/4382) | an index length is an outer extent again, a table length is only a range constraint and needs no loop |
-| Innermost stick dimension | the dimension measured in sticks | **deferred, not ruled out** | see below |
 | Address or stride component | the value participates in computing where data sits | **ruled out by cost** | see below |
 
-### 6.1 The stick dimension 
-
-With an explicit loop, the varying axis is tiled before anything downstream sees it, so inside the loop body that axis has the fixed extent G. The question is therefore not whether a symbolic dimension can be innermost. It is whether a G-wide tile of the innermost axis lands on stick boundaries. It does, as long as G is a multiple of the elements per stick for the dtype, which is 64 at fp16. That is an alignment condition on the granularity, nothing more.
-
-The backend side is already settled. A dimension that is not outermost in the layout is laid out at its maximum stride, and that rule is written for any dimension, not only for outer ones.
-
-Guards that refuse a symbolic stick dimension belong to the earlier route, where the symbolic dimension stayed inside an operation's iteration space. On the loop route the body's iteration space is a static tile, so they never see a symbol.
-
-The stick axis is out of Phase 1 because our usecases mark the outer axis, not because anything below refuses it.
-
-### 6.2 Symbolic addresses 
+### 6.1 Symbolic addresses 
 
 The backend does support symbolic addresses. There is an agreed interface for it, and the earlier design went that way, ref [#2289](https://github.com/torch-spyre/torch-spyre/issues/2289). The front end would emit either per-core symbolic start addresses or one base symbol plus formulas for the backend to evaluate.
 
@@ -197,7 +186,7 @@ We are not taking it, for one measured reason. Passing symbols to the execute no
 
 ### 7.1 What this design depends on
 
-| Dependency | Owner |
+| Dependency | Component |
 |---|---|
 | The dynamic tensor's HBM buffer has capacity for the declared maximum | runtime |
 | A dimension that is not outermost in the device layout is laid out at max stride | runtime |
@@ -514,11 +503,6 @@ classDiagram
     +out_dim
     +init
   }
-  class TileSpec {
-    +dim
-    +tile_size
-    +num_tiles
-  }
   class WhileLoop {
     +cond_graph
     +body_graph
@@ -535,7 +519,6 @@ classDiagram
     +tiled_symbols
     +symbolic_dim_bounds
   }
-  ForEachTile --> TileSpec : one per operand
   ForEachTile --> WhileLoop : scan decomposes
   WhileLoop --> LoopSpec : compiled to
   LoopSpec o-- OpSpec : body
@@ -665,9 +648,6 @@ None of these are needed for the feature to work. They are listed so the first r
 
 **More than one granularity over the range.** A model may want a fine step at small sizes and a coarse one at large sizes. The annotation already accepts this shape, since a list of the same range dicts expresses it. The cost is that each granularity is a separate binary for every kernel touching the varying axis, so cold compile time multiplies. Parallelising the per-SDSC backend invocations is a prerequisite before this is worth turning on.
 
-**Keeping static weights resident.** In map mode an invariant operand is handed to every step. It should be staged once and kept resident across iterations rather than re-staged per step. This is a real device-time saving and it currently has no ticket.
-
-**Measuring the device-time cost of a range.** A kernel compiled for a range cannot make shape-specific tiling or residency choices, so some regression against a static kernel at a single shape is expected. Measure it per op class, and use that to decide where the cost model earns its compile time.
 
 ## 14. Op and model coverage
 
@@ -676,7 +656,6 @@ An op is safe under a symbolic count when it reads only inside its own tile alon
 | Op class | Along the varying axis | Verdict |
 |---|---|---|
 | Pointwise, for example gelu, add, multiply | reads only its own element | Phase 1 |
-| Reduction across the other axes, for example mean over hidden per row | the varying axis survives into the output | Phase 1 |
 | Matmul where the varying axis is the outer axis | contraction is over a static axis | Phase 1 |
 | Layer norm over the hidden axis | the normalised axis is static | Phase 1 |
 | Elementwise with two independently marked operands | two symbols, two counts | needs the equality assertion of invariant 4 |

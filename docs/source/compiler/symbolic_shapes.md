@@ -15,7 +15,7 @@ How torch-spyre compiles a model once and runs it at many input sizes without re
 | Term | Meaning |
 |---|---|
 | Stick | the hardware's unit of layout, 128 bytes, so 64 elements at fp16. The innermost dimension of a tensor's device layout is measured in sticks |
-| SDSC | the static description of one compute step that the backend compiler consumes |
+| SDSC | the static description of one compute step that deeptools consumes |
 | Bundle | the MLIR program around the SDSC steps. It holds the control flow, including our loop |
 | LX | the on-chip scratchpad a tile has to fit into |
 | Granularity, G | the step between admissible runtime sizes. The runtime size must be a multiple of it |
@@ -33,7 +33,7 @@ How torch-spyre compiles a model once and runs it at many input sizes without re
 
 Shapes that reach a serving backend vary, and they vary a lot. Decoder serving varies every iteration, because continuous batching ([Orca](https://www.usenix.org/conference/osdi22/presentation/yu), now standard through [vLLM](https://arxiv.org/abs/2309.06180)) changes the packed token count on almost every dispatch. Encoder serving varies per request, since query and document lengths differ, and inference servers form variable batches from arriving requests to keep the accelerator busy. [Triton's dynamic batching guide](https://docs.nvidia.com/deeplearning/triton-inference-server/user-guide/docs/tutorials/Conceptual_Guide/Part_2-improving_resource_utilization/README.html) is the standard description of that pattern.
 
-torch-spyre today compiles one binary per exact shape. A cold compile of a large-context model takes about an hour at 32k sequence length, most of it in per-SDSC backend optimisation. Covering k shapes means k full compilations, paid again after every stack upgrade.
+torch-spyre today compiles one binary per exact shape. A cold compile of a large-context model takes about an hour at 32k sequence length, most of it in per-SDSC optimisation inside deeptools. Covering k shapes means k full compilations, paid again after every stack upgrade.
 
 ### 2.2 How other systems absorb a shape change
 
@@ -59,20 +59,19 @@ flowchart TB
     h["hf-adapters<br/>encoder batch varies"]
     f["FMS"]
   end
-  subgraph ours["torch-spyre compiler, this document"]
-    dyn["Dynamo and Inductor<br/>symbol lives here already"]
-    br["symbolic bridge<br/>NEW"]
-    cg["codegen<br/>SDSC + bundle"]
+  subgraph ours["torch-spyre front end"]
+    dyn["Dynamo and Inductor"]
+    br["symbolic bridge NEW"]
+    cg["codegen SDSC + bundle"]
     dyn --> br --> cg
   end
-  subgraph below["Owned by other teams"]
-    dt["backend compiler<br/>builds the device loop"]
-    rt["runtime<br/>allocation and launch"]
+  subgraph below["Other components"]
+    rt["torch-spyre runtime<br/>allocation and launch"]
+    dt["deeptools<br/>builds the device loop"]
   end
-  con -->|"tensor marked dynamic,<br/>then a real size per call"| ours
+  con -->|"marked tensor, then a real size per call"| ours
   ours -->|"static SDSC + bundle<br/>with a symbolic loop bound"| dt
-  dt --> rt
-  rt -->|"binds the trip count at launch"| rt
+  ours -->|"real size per dispatch"| rt
 ```
 
 ## 3. The core idea
@@ -92,7 +91,7 @@ flowchart TB
     t --> sd
     t --> bu
   end
-  subgraph rtm["Runtime, per dispatch, same binary"]
+  subgraph rtm["Runtime, same binary"]
     d1["S = 128<br/>count = 2"]
     d2["S = 320<br/>count = 5"]
     d3["S = 512<br/>count = 8"]
@@ -143,13 +142,12 @@ And the divergence point is a single, identifiable place. PyTorch is perfectly h
 
 Confining the symbol to a trip count works cleanly only when each tile can be computed on its own. The loop runs tile after tile, and every tile reads its own slice, computes, and writes its own slice. Nothing carries across.
 
-That breaks the moment an operation has to combine values from **different tiles**. A sum along the varying axis is the simple case: tile 0's partial result has to survive into tile 1. Three things then go wrong at once.
+That breaks the moment an operation has to combine values from **different tiles**. A sum along the varying axis is the simple case: tile 0's partial result has to survive into tile 1. Two things then go wrong.
 
-- The bundle allows no loop-carried variable, so the running value has to sit in a fixed buffer and be copied every iteration.
-- That copy serialises the loop, so the tiles can no longer be spread across cores.
-- The number of tiles is symbolic, so anything that needs the true count, like a mean, cannot get it from the geometry. It has to come in as data.
+- The bundle allows no loop-carried variable, so the running value has to sit in a fixed buffer and be copied every iteration. That copy is a dependency between trips, so one trip's tail cannot overlap the next trip's head.
+- Anything that needs the true count, like the divisor in a mean, cannot read it off the geometry, because the binary is built for a range. It arrives as data instead. Cheapest form is the host passing the reciprocal as a scalar, so the device multiplies and never divides.
 
-None of that is unsolvable, but it is a different piece of engineering and it carries a performance cost the simple case does not. The line is between "each tile stands alone" and "tiles have to talk to each other".
+The first one is the real cost. The second is close to free. The line is between "each tile stands alone" and "tiles have to talk to each other".
 
 ### 5.2 Phase 1, where the varying axis is an outer axis
 
@@ -167,7 +165,7 @@ Technically much deeper. The sequence sits on both axes of the score matrix and 
 
 ## 6. Where a symbol may legally live
 
-A runtime varying value can land in exactly five places, and each has a fixed answer.
+A runtime varying value can land in four places, and each has a fixed answer.
 
 | Role | What it means | Status | Why |
 |---|---|---|---|
@@ -176,22 +174,34 @@ A runtime varying value can land in exactly five places, and each has a fixed an
 | Index or table length | the length of an index tensor, or the table it reads | **separate track**, ref [#4382](https://github.com/torch-spyre/torch-spyre/issues/4382) | an index length is an outer extent again, a table length is only a range constraint and needs no loop |
 | Address or stride component | the value participates in computing where data sits | **ruled out by cost** | see below |
 
-### 6.1 Symbolic addresses 
+### 6.1 Symbolic addresses, and the correction route
 
-The backend does support symbolic addresses. There is an agreed interface for it, and the earlier design went that way, ref [#2289](https://github.com/torch-spyre/torch-spyre/issues/2289). The front end would emit either per-core symbolic start addresses or one base symbol plus formulas for the backend to evaluate.
+The backend does support symbolic addresses. There is an agreed interface for it and the earlier design went that way, ref [#2289](https://github.com/torch-spyre/torch-spyre/issues/2289). The front end would emit either per-core symbolic start addresses or one base symbol plus formulas for the backend to evaluate.
 
-We are not taking it, for one measured reason. Passing symbols to the execute node puts every dispatch on the host program correction path, which rewrites the binary before each launch at high microseconds per dispatch, per kernel, synchronously. That cost is paid on every call forever, and it is larger than the recompile cost we are trying to remove. Section 17 records this as a rejected alternative rather than an open question.
+We are not taking it for the loop-count case, for one measured reason. Passing symbols to the execute node puts every dispatch on the host program correction path, which rewrites the binary before each launch at high microseconds per dispatch, per kernel, synchronously. That cost is paid on every call forever, and it is larger than the recompile cost we are trying to remove.
+
+There is separate work in flight that does build the correction route for dimensions, ref [#4370](https://github.com/torch-spyre/torch-spyre/issues/4370) with [PR #4911](https://github.com/torch-spyre/torch-spyre/pull/4911) and [PR #4993](https://github.com/torch-spyre/torch-spyre/pull/4993). It resolves a dimension symbol per launch through the SuperDSC symbol table so a host correction can read it. That is not a competing answer to the same question, it is the mechanism for the cases a loop bound cannot express, indirect access and strided scatter being the live ones.
+
+The two have to stay separated by one rule, because they disagree about the execute node's symbol list and our whole cost argument rests on that list staying empty for a map-mode kernel.
+
+| Question | Mechanism |
+|---|---|
+| How many independent pieces of work are there | loop count, bundle `input_arg`, no symbol on the execute node |
+| Where does a given piece read or write | dimension symbol, correction route, symbol on the execute node and the cost that comes with it |
+
+A kernel built by this design answers only the first, so it must not acquire a symbol id along the way. Reconciling the two is an open item, Section 20.
 
 ## 7. The contract
 
 ### 7.1 What this design depends on
 
-| Dependency | Component |
-|---|---|
-| The dynamic tensor's HBM buffer has capacity for the declared maximum | runtime |
-| A dimension that is not outermost in the device layout is laid out at max stride | runtime |
-| The device loop takes its bound from an input argument | backend compiler |
-| The size supplied at dispatch is within range and a multiple of the granularity | consumer |
+| Dependency | Component | Ticket |
+|---|---|---|
+| The dynamic tensor's HBM buffer has capacity for the declared maximum | torch-spyre runtime | [#2434](https://github.com/torch-spyre/torch-spyre/issues/2434) |
+| A dimension that is not outermost in the device layout is laid out at max stride | torch-spyre runtime | [#2434](https://github.com/torch-spyre/torch-spyre/issues/2434) |
+| The real size is bound into an argument slot at dispatch | torch-spyre runtime | [#4964](https://github.com/torch-spyre/torch-spyre/issues/4964) |
+| The device loop takes its bound from an input argument | deeptools | [#4397](https://github.com/torch-spyre/torch-spyre/issues/4397), [#1522](https://github.com/torch-spyre/torch-spyre/issues/1522) |
+| The size supplied is within range and a multiple of the granularity | caller | [#4384](https://github.com/torch-spyre/torch-spyre/issues/4384) |
 
 Core division is not on that list. Work division operates on the loop body, which is a static tile, so it divides a fixed extent across cores exactly as it does for a static kernel.
 
@@ -217,7 +227,7 @@ compiled = torch.compile(model, dynamic=None)
 
 `min` and `max` are the range the guard enforces. `granularity` is the step between admissible sizes. If `granularity` is omitted it defaults to `min`, which keeps older call sites working.
 
-`min` and `granularity` are kept separate because one is a range bound and the other is a step. Conflating them means the API has to change the day a model wants a fine step near the bottom of the range and a coarse one at the top. With granularity named, that later change is a list of these same dicts and nothing downstream moves. It also reads correctly to an integrator in hf-adapters or spyre-inference, who should not have to know that `min` secretly controls tiling.
+`min` and `granularity` stay separate fields. One is a range bound, the other is a step, and more than one granularity over the range is already on the roadmap. Ticket for the API change is drafted.
 
 Rules. `max` must be a multiple of `granularity`. `min` must be at least 2, since PyTorch specialises sizes 0 and 1. Phase 1 marks the outer axis, dim 0. Weights are never marked, they do not vary and a symbol on the weight side lands in a stride or a contraction axis. `dynamic` stays `None` on `torch.compile`, because `True` would mark every dimension including the stick dimension.
 
@@ -225,12 +235,14 @@ Rules. `max` must be a multiple of `granularity`. `min` must be at least 2, sinc
 
 | Interface | Carries | Direction |
 |---|---|---|
-| Bundle `input_arg` | `granularity` and `max_value` for the symbol, read as the loop bound | us to the backend |
-| SDSC | one tile, fully static geometry | us to the backend |
-| `sdsc_execute` symbol list | stays empty, see invariant 1 | us to the backend |
-| Launch | the trip count bound into an argument slot | runtime, per dispatch |
+| Bundle `input_arg` | `granularity` and `max_value` for the symbol, read as the loop bound | torch-spyre to deeptools |
+| SDSC | one tile, fully static geometry | torch-spyre to deeptools |
+| `sdsc_execute` symbol list | stays empty, see invariant 1 | torch-spyre to deeptools |
+| Launch | the real size bound into an argument slot | torch-spyre runtime, per dispatch |
 
-The single source of truth for granularity and max is the bundle input argument. The backend has confirmed it will derive the SDSC-side values from there rather than requiring us to fill them twice.
+The single source of truth for granularity and max is the bundle input argument. deeptools has confirmed it will derive the SDSC-side values from there rather than requiring us to fill them twice.
+
+We pass the size and not the trip count. The tile size is a per-kernel decision the compiler makes, so only the compiler can turn a size into a count, and the device already has to hold the bound as a value anyway. The division lands in the bundle as a `ceildivsi`, which deeptools is adding.
 
 ## 8. WSR 2.0, and where the symbolic bridge sits
 
@@ -276,51 +288,68 @@ flowchart LR
   class ls,sf,sd us
 ```
 
-The first three boxes are existing PyTorch machinery. `scan` is a standard higher-order op and the WhileLoop IR already ships with PyTorch. Both WSR 1.0 and 2.0 land on the same `LoopSpec` and the same `scf.for`, so nothing is renegotiated with the backend by this change.
+The first three boxes are existing PyTorch machinery. `scan` is a standard higher-order op and the WhileLoop IR already ships with PyTorch. Both WSR 1.0 and 2.0 land on the same `LoopSpec` and the same `scf.for`, so nothing is renegotiated with deeptools by this change.
 
-### 8.3 The bridge, which is the new component
+### 8.3 The bridge, and where it sits
 
 **The user never writes a `for_each_tile`.** Requiring model authors to restructure their code would kill portability, and a stock BERT or Granite would stop being stock.
 
-The piece that turns a marked dynamic dimension into a tiled loop is the bridge, and it is the main new component of this design. Ref [#4379](https://github.com/torch-spyre/torch-spyre/issues/4379), prototype in [PR #4136](https://github.com/torch-spyre/torch-spyre/pull/4136).
+The piece that turns a marked dynamic dimension into a tiled loop is the bridge, and it is the main new work in this design. Ref [#4379](https://github.com/torch-spyre/torch-spyre/issues/4379).
+
+Where it sits is already decided by how `for_each_tile` works. It is not a graph node. It is ordinary Python in `wsr/for_each_tile.py` that builds a `combine_fn` and calls `scan`, so no pass can insert it as a node. What can call it is a decomposition, while AOT is tracing. The SDPA decomposition already does that in two places in `_inductor/decompositions.py`, and `for_each_tile` carries an explicit branch for being reached that way instead of through Dynamo.
+
+So the bridge is two pieces and only the first one is new.
+
+| Piece | Where it goes | Status |
+|---|---|---|
+| Region selection: pick the ops that should share one loop, lift them into a submodule, replace them with a single `spyre.tiled_region` call | `CustomPreGradPasses`, the pre-grad FX extension point, empty today | new |
+| Loop construction: a decomposition of `spyre.tiled_region` that calls `for_each_tile` with `tile_size` set to the granularity | `_inductor/decompositions.py`, next to the SDPA ones | existing pattern |
+
+Pre-grad and not post-grad, because decompositions run during AOT tracing and a post-grad pass is past that point.
 
 ```mermaid
 flowchart TB
-  u["model code, unchanged<br/>z = x + y"]
-  dy["Dynamo<br/>dim 0 becomes a symbol"]
-  ind["Inductor graph<br/>op iteration space contains the symbol"]
-  br["THE BRIDGE (ours)<br/>1. find ops whose iteration space holds a marked symbol<br/>2. assert shared axes are equal (invariant 4)<br/>3. pick the mode: map if tile-local, else refuse for now<br/>4. author for_each_tile with tile_size = G"]
-  fet["for_each_tile in the graph"]
-  rest["scan, WhileLoop, LoopSpec, codegen"]
-  u --> dy --> ind --> br --> fet --> rest
+  u["model code, unchanged"]
+  dy["Dynamo marks dim 0"]
+  p1["BRIDGE 1 region selection"]
+  op["spyre.tiled_region node"]
+  p2["BRIDGE 2 decomposition"]
+  fet["for_each_tile"]
+  rest["scan, WhileLoop, LoopSpec"]
+  u --> dy --> p1 --> op --> p2 --> fet --> rest
   classDef new fill:#f2e5d0,stroke:#9a5a12;
-  class br new
+  class p1,p2 new
 ```
 
 #### What triggers it
 
 Nothing in the model. The trigger comes from the annotation. When a tensor is moved to the device with a dynamic dimension declared, that dimension is marked underneath and Dynamo records it as a symbol with a finite range in the shape environment. A finite range is the signal: a dimension that went dynamic by accident, because Dynamo promoted an integer on a retrace, has no finite maximum and is deliberately left alone.
 
-So the bridge runs inside our compile path, after Inductor has lowered the graph, and it only does anything when at least one marked symbol is present. A fully static model compiles exactly as it does today and never touches this code.
+A fully static model never enters either piece and compiles exactly as it does today.
 
-#### What it does, in order
+#### Why a region and not one op at a time
 
-| Step | Action | Why |
-|---|---|---|
-| 1 | find the operations whose iteration space contains a marked symbol | these are the only ones that need a loop |
-| 2 | emit an equality check for every pair of operands that share the varying axis | without it two operands give two symbols and two trip counts, invariant 4 |
-| 3 | decide the mode per operation, map if every read stays inside its own tile, otherwise refuse for now | the coverage decision of Section 14, made once and in one place |
-| 4 | author the `for_each_tile` with `tile_size` set to the granularity, `dims` set per operand kind, and `out_dim` for map mode | it then lowers through existing machinery |
+A decomposition registered on `aten.add` would give one loop per add. Separate `for_each_tile` calls get separate loop group ids, and the scheduler groups by that id, so `x + y` then `* 2` then `gelu` would become three sequential device loops each re-reading its tile from HBM. That is the opposite of working set reduction. The region has to be chosen before the loop is built, which is why selection is a pass and not a decomposition.
 
-Step 3 is a single decision point, so when reduction mode lands it becomes a second branch at the same place rather than a second path through the compiler.
+The Phase 1 rule is deliberately narrow.
 
-#### What it does not do
+| Step | Action |
+|---|---|
+| 1 | seed from inputs whose fake value carries a marked symbol |
+| 2 | grow forward while every op is pointwise or a broadcast and the marked axis passes through one to one |
+| 3 | stop at the first reduction along that axis, reshape across it, or matmul contraction on it |
+| 4 | emit an equality check for operands sharing the axis, invariant 4 |
+| 5 | lift the region and hand the granularity through as `tile_size` |
 
-It does not rewrite model code, it does not require the model to import anything, and it does not run for static shapes. Hand-written `for_each_tile` stays available as a compiler-side escape hatch, the way the attention decomposition uses it today, but it is not a user-facing API.
+If the region's inputs do not share one symbol on that axis, refuse the region and leave the graph alone. An unhandled shape then degrades to today's behaviour instead of failing the compile. Reduction mode lands later as a second branch at step 3.
 
-### 8.4 Working alongside the WSR 2.0 effort
+Hand-written `for_each_tile` stays available as a compiler-side escape hatch, the way the SDPA decomposition uses it today. It does not become a user-facing API.
 
-Two contact points stay live. The nesting work and the attention rework both touch the metadata used to carry backend hints, so its replacement needs agreeing, ref [#4551](https://github.com/torch-spyre/torch-spyre/issues/4551). Robustness work on the `for_each_tile` and WhileLoop infrastructure is in flight, ref [PR #4751](https://github.com/torch-spyre/torch-spyre/pull/4751).
+### 8.4 What WSR 2.0 has already delivered
+
+The epic is closed, ref [#3965](https://github.com/torch-spyre/torch-spyre/issues/3965), and the parts this design leans on are merged: the op itself ([#4136](https://github.com/torch-spyre/torch-spyre/pull/4136)), nesting ([#4705](https://github.com/torch-spyre/torch-spyre/pull/4705)), the SDPA rewrite onto nested `for_each_tile` ([#4551](https://github.com/torch-spyre/torch-spyre/pull/4551)), and a round of correctness fixes on the WhileLoop path ([#4751](https://github.com/torch-spyre/torch-spyre/pull/4751)).
+
+Two consequences for us. Nesting being merged is what makes Phase 2 a tile_size question rather than new machinery. And the SDPA rewrite is the working example of a decomposition authoring `for_each_tile`, which is the pattern the bridge reuses.
 
 ## 9. Worked examples
 
@@ -394,7 +423,7 @@ _, y = for_each_tile(
 flowchart LR
   xt["x tile<br/>(64, 1024)"]
   wt["W (1024, 512)<br/>INVARIANT"]
-  acc["accumulate over 1024<br/>STATIC axis, entirely inside one tile"]
+  acc["accumulate over 1024<br/>STATIC, inside one tile"]
   yt["y tile<br/>(64, 512)"]
   xt --> acc
   wt --> acc
@@ -461,15 +490,18 @@ Every kernel gets the same trip count, resolved once per dispatch from the same 
 sequenceDiagram
   participant U as Consumer
   participant D as Dynamo
-  participant I as Inductor
   participant B as Bridge
+  participant A as AOT
+  participant I as Inductor
   participant C as Codegen
   U->>D: marked tensor, warmup call
-  D->>I: dim 0 is a sympy symbol, range in ShapeEnv
-  I->>B: graph with the symbol in iteration spaces
-  B->>B: equality checks, mode choice, tile_size = G
-  B->>I: for_each_tile in the graph
-  I->>C: scan, WhileLoop, LoopSpec with a symbolic count
+  D->>B: dim 0 is a symbol, range in ShapeEnv
+  B->>B: select region, lift it, emit tiled_region
+  B->>A: graph with one tiled_region node
+  A->>A: decomposition calls for_each_tile
+  A->>I: scan and WhileLoop
+  I->>I: splice into a static tile plus a loop count
+  I->>C: LoopSpec, count symbolic
   C->>C: SDSC for the tile, static
   C->>C: bundle with scf.for over an input_arg
 ```
@@ -484,9 +516,9 @@ sequenceDiagram
   participant Dv as Device
   U->>P: call with a real size S
   P->>P: in range? multiple of G? else refuse
-  P->>R: launch, trip count = S / G
-  R->>Dv: bind the count into the argument slot
-  Dv->>Dv: scf.for runs exactly that many tiles
+  P->>R: launch with S
+  R->>Dv: bind S into the argument slot
+  Dv->>Dv: bound = ceildiv(S, tile), scf.for runs that many tiles
   Dv->>U: output, first S rows valid
 ```
 
@@ -511,6 +543,7 @@ classDiagram
   class LoopSpec {
     +count
     +body
+    +count_symbol_bounds
   }
   class OpSpec {
     +op
@@ -524,9 +557,9 @@ classDiagram
   LoopSpec o-- OpSpec : body
   LoopSpec o-- LoopSpec : nested
 ```
-- The loop count is per nesting level, and each level is independently a constant or a symbol. That is already the shape the nested case needs.
+- The loop count is per nesting level, and each level is independently a constant or a symbol. Nesting is merged, so that shape already works.
 - The WhileLoop carried state cannot survive into the bundle, `scf.for` allows none. The carry goes to a fixed buffer moved with copies, which is what Section 9.4 pays for.
-- The op spec keeps the symbolic bounds as metadata, the max and granularity per symbol, which is what fills the bundle argument.
+- `count_symbol_bounds` carries the max and granularity per symbol down to codegen. It has to be carried rather than looked up, because codegen also runs in a reload phase where the ShapeEnv is gone.
 
 ### 10.4 The symbol's names along the way
 
@@ -564,11 +597,11 @@ x = x.to("spyre", dynamic={0: [
 ]})
 ```
 
-Two bands means two tile sizes, and the tile size is baked into the SDSC, so every kernel touching the varying axis is compiled twice. N bands is N binaries per kernel. Cold compile time multiplies by N, which is why this is not in the first release: cold compile time is the cost the whole project exists to reduce, so spending it back needs the parallel backend invocation work first.
+Two bands means two tile sizes, and the tile size is baked into the SDSC, so every kernel touching the varying axis is compiled twice. N bands is N binaries per kernel. Cold compile time multiplies by N, which is why this is not in the first release: cold compile time is the cost the whole project exists to reduce, so spending it back needs the parallel per-SDSC invocation work first.
 
 Dispatch with bands is two steps instead of one. Find the band the size falls in, then check the multiple against that band's granularity. Size 704 shows why both steps are needed. It is inside the global range, and it divides 64, but it falls in band B whose granularity is 256, so it is refused. A single global divisibility check would have let it through.
 
-Everything below the dispatcher is band blind. Each band is an ordinary compiled artifact with a static tile, so nothing in the bridge, the bundle, the backend contract or the runtime changes. Bands cost compile time and program memory, not design.
+Everything below the dispatcher is band blind. Each band is an ordinary compiled artifact with a static tile, so nothing in the bridge, the bundle, the deeptools contract or the runtime changes. Bands cost compile time and program memory, not design.
 
 Choosing a granularity automatically, rather than taking the one the user gave, is a separate optimisation and is covered in Section 13.
 
@@ -578,7 +611,7 @@ The one constraint on G that is live today is the alignment condition of Section
 
 Tile `i` sits at `base + i * G * row_stride`, and the row stride does not depend on the varying axis. So every tile address is a compile-time constant and a smaller runtime size does not move anything, it only makes fewer tiles live.
 
-There is a useful distinction the backend guidance draws, and it changes how much memory we hold.
+There is a useful distinction the deeptools guidance draws, and it changes how much memory we hold.
 
 | The varying dim is | Layout requirement | Memory effect |
 |---|---|---|
@@ -642,11 +675,13 @@ For a graceful stop the public API is the compiler stance that fails on recompil
 
 ## 13. Optimisations [ In scope after functional enablement ] 
 
-None of these are needed for the feature to work. They are listed so the first release is not accidentally scoped to include them, and so the follow-on work is visible.
+None of these are needed for the feature to work.
 
-**Choosing the granularity automatically.** The user gives one granularity and we use it. A cost model could instead pick a smaller execution granularity that fits the LX scratchpad better, trading more loop iterations for a tile that fits with room to double buffer. The design exists and is filed as ref [#4381](https://github.com/torch-spyre/torch-spyre/issues/4381). The rule it has to hold when it lands is that the execution granularity divides the contract granularity, so every tile stays full and the user-facing contract does not move. It is not on the critical path and nothing in the first release waits for it.
+**Choosing the granularity automatically.** Today the user's granularity is used as is. A cost model could pick a smaller execution granularity that fits LX better, trading more iterations for room to double buffer. Ref [#4381](https://github.com/torch-spyre/torch-spyre/issues/4381). The rule it must hold is that the execution granularity divides the contract granularity, so the user-facing contract does not move.
 
-**More than one granularity over the range.** A model may want a fine step at small sizes and a coarse one at large sizes. The annotation already accepts this shape, since a list of the same range dicts expresses it. The cost is that each granularity is a separate binary for every kernel touching the varying axis, so cold compile time multiplies. Parallelising the per-SDSC backend invocations is a prerequisite before this is worth turning on.
+**More than one granularity over the range.** Fine steps at small sizes, coarse at large. Each granularity is a separate binary per kernel on the varying axis, so this needs the parallel per-SDSC invocation work first.
+
+**Region widening.** Phase 1 uses the narrow region rule of Section 8.3. Widening it means fewer loops and fewer HBM re-reads, and it is the same cost model question as granularity.
 
 
 ## 14. Op and model coverage
@@ -725,7 +760,7 @@ The pieces you already have map directly. `SpyreAttnBucketer` holds `query_bucke
 
 A staged migration works. Make one axis symbolic first, keep the rest bucketed, and compare. Nothing in the design requires all axes to move together.
 
-Paged attention is a registered custom op, so it is an opaque boundary to the compiler. The varying token count crosses it and we never compile inside it. This is the reason the decode path is in the first phase at all, and it means the attention backend needs no change for this feature.
+Paged attention is a registered custom op, so it is an opaque boundary to the compiler. The varying token count crosses it and we never compile inside it. This is the reason the decode path is in the first phase at all, and it means the attention path needs no change for this feature.
 
 ### 15.4 hf-adapters
 
@@ -745,17 +780,19 @@ For the batch and token-count axis the buffer needs capacity for the declared ma
 
 The caution is that a generous maximum is not free. Declaring a much larger max than you will really serve reserves memory you could have spent on KV cache. Activation memory is not currently accounted for on the vLLM path, so an over-commitment shows up as a crash rather than as a clean out-of-memory error. Pick the max from what you will actually admit.
 
-## 16. Non front end compiler work
+## 16. Work outside the front end
 
-### 16.1 Runtime: allocation
+Two components, torch-spyre and deeptools.
+
+### 16.1 torch-spyre runtime: allocation
 
 The dynamic tensor's buffer needs capacity for the declared maximum, and for an inner symbolic dimension the layout has to be at max stride. Section 11.2 has the distinction. Ref [#2434](https://github.com/torch-spyre/torch-spyre/issues/2434).
 
-### 16.2 Runtime: dispatch and launch
+### 16.2 torch-spyre runtime: dispatch and launch
 
-At dispatch the runtime binds base addresses and one loop scalar into the argument slots. Ref [#221](https://github.com/torch-spyre/torch-spyre/issues/221).
+At dispatch the runtime binds base addresses and the real size into the argument slots. Ref [#4964](https://github.com/torch-spyre/torch-spyre/issues/4964), superseding [#221](https://github.com/torch-spyre/torch-spyre/issues/221).
 
-### 16.3 Backend: the device loop
+### 16.3 deeptools: the device loop
 
 The distinction the host makes at dispatch is the whole game.
 
@@ -774,23 +811,23 @@ Argument binding fills a value into a slot the program reads at launch, and the 
 
 Two facts hold the contract together. The execute node keeps its symbol list empty, because the correction path is gated exactly on that list. And addresses carry no symbols.
 
-One detail is still open and it is small. The bound can arrive as the size with a step of G, or as a precomputed count with a step of one. The WhileLoop iterates a tile index against a ready count, which leans to the second. Either works. The golden example will pin it and then both sides build to that.
+What crosses the boundary is the size, not the count, for the reason in Section 7.4. The bundle derives the bound with a `ceildivsi`, which deeptools is adding.
 
-Backend loop support is already tracked on the backend side: a parent issue with children for a fixed bound, for looping by repeating programs, and for a **symbolic bound by program looping**, which is the one matching this design and is unassigned. Our ask, ref [#4397](https://github.com/torch-spyre/torch-spyre/issues/4397), describes the same capability from the torch-spyre side plus a request for an example bundle and SDSC pair. The two should be reconciled before the next backend conversation, and ours likely folds into it.
+Loop support is tracked on the deeptools side as two options, by repeating programs ([#1520](https://github.com/torch-spyre/torch-spyre/issues/1520)) and by program looping with a symbolic bound ([#1522](https://github.com/torch-spyre/torch-spyre/issues/1522)). The second is the one this design needs and it is unassigned. Our ask [#4397](https://github.com/torch-spyre/torch-spyre/issues/4397) describes the same capability plus a request for an example bundle and SDSC pair, so it likely folds into #1522.
 
-That example is the hard dependency for emission, ref [#4380](https://github.com/torch-spyre/torch-spyre/issues/4380). Until it lands, symbolic emission stays behind a clear not-supported error.
+That example is what unblocks emission, ref [#4380](https://github.com/torch-spyre/torch-spyre/issues/4380).
 
 ## 17. Alternatives considered and rejected
 
 | Alternative | Why not |
 |---|---|
-| Symbolic addresses in the SDSC | the backend supports it and an interface exists, ref [#2289](https://github.com/torch-spyre/torch-spyre/issues/2289). But it puts every dispatch on the host correction path at high microseconds per kernel, forever. That is worse than the recompile cost we are removing |
+| Symbolic addresses in the SDSC | deeptools supports it and an interface exists, ref [#2289](https://github.com/torch-spyre/torch-spyre/issues/2289). But it puts every dispatch on the host correction path at high microseconds per kernel, forever. That is worse than the recompile cost we are removing |
 | Bucketing, a binary per size band | multiplies cold compile time and binary count, and still pads. It is the thing this design replaces, not a fallback |
-| Specialising the trip count to an integer and compiling a variant per count | works on today's backend with no new support, and is implemented in [PR #4684](https://github.com/torch-spyre/torch-spyre/pull/4684). But it compiles on the dispatch path, the binary count grows with distinct shapes, and it declines map mode with stacked outputs by name, which is our dynamic batch case. It is shape specialisation with extra steps, so it does not reach the goal of one binary for a range |
+| Specialising the trip count to an integer and compiling a variant per count | works on today's deeptools with no new support, and is implemented in [PR #4684](https://github.com/torch-spyre/torch-spyre/pull/4684). But the compile happens on the dispatch path, so an unseen count stalls a forward pass, the variant set grows with the data and is never evicted, and it declines map mode with stacked outputs by name, which is our dynamic batch case. It keeps the count inside the binary, so it does not reach one binary for a range |
 | Making the granularity structural in the reshape | does not work. Every reshape spelling produces the same divided expression, see Appendix A |
 | Requiring model authors to write `for_each_tile` | breaks portability. A stock model would stop being stock |
 
-The PR #4684 work is still useful to us. It splits the planning extent from the runtime count, which is our invariant implemented, and that part is shared regardless of how the count is finally realised.
+On #4684, the part worth keeping is the split between the planning extent and the runtime count, which is our invariant 2 implemented in the spec layer. We are not blocked on it. Our bridge authors the loop, so it already knows the marked dimension and the granularity and does not need to recover a count out of a lowered subgraph. What is left is small and we have written our own, so the overlap is a merge conflict to manage rather than a dependency.
 
 ## 18. Delivery plan
 
@@ -798,11 +835,11 @@ Ordered by dependency. Stage 1 is the only stage where nothing is usable until e
 
 ```mermaid
 flowchart TB
-  s1["STAGE 1 Functional enablement<br/>one binary actually serves a range"]
+  s1["STAGE 1 Functional enablement<br/>one binary serves a range"]
   s2["STAGE 2 Guard enforcement<br/>safe to expose to a consumer"]
   s3["STAGE 3 Adjacent epic work<br/>indirect access"]
   s4["STAGE 4 Optimisations<br/>granularity cost model"]
-  s5["STAGE 5 Extended op coverage<br/>reductions, matmul, then Phase 2"]
+  s5["STAGE 5 Extended op coverage<br/>reductions, matmul, Phase 2"]
   s1 --> s2 --> s3
   s2 --> s4
   s2 --> s5
@@ -812,16 +849,16 @@ flowchart TB
 
 ### 18.1 Stage 1, functional enablement
 
-Four parties have to deliver for one binary to serve a range, and until all four are in place none of them delivers any value on its own. This is the gate for the whole project.
+Four things have to be true for one binary to serve a range, and none of them delivers value on its own. This is the gate for the whole project.
 
-| Who | What has to be true | Ticket |
+| Component | What has to be true | Ticket |
 |---|---|---|
-| Compiler, us | the bridge turns a marked dimension into a tiled loop, and the emitted bundle carries a symbolic loop bound over a static per-tile SDSC | [#4379](https://github.com/torch-spyre/torch-spyre/issues/4379), [#4380](https://github.com/torch-spyre/torch-spyre/issues/4380) |
-| Runtime, allocation | the dynamic tensor's HBM buffer is allocated correctly for the declared maximum, with the right layout | [#2434](https://github.com/torch-spyre/torch-spyre/issues/2434) |
-| Runtime, dispatch | the launch passes the correct trip count into the argument slot for that call | [#221](https://github.com/torch-spyre/torch-spyre/issues/221) |
-| Backend compiler | a loop whose bound comes from an input argument is accepted and executed | [#4397](https://github.com/torch-spyre/torch-spyre/issues/4397), reconciled with the backend issue |
+| Front end | the bridge turns a marked dimension into a tiled loop, and the bundle carries a symbolic loop bound over a static per-tile SDSC | [#4379](https://github.com/torch-spyre/torch-spyre/issues/4379), [#4380](https://github.com/torch-spyre/torch-spyre/issues/4380) |
+| torch-spyre runtime | the HBM buffer is allocated for the declared maximum with the right layout | [#2434](https://github.com/torch-spyre/torch-spyre/issues/2434) |
+| torch-spyre runtime | the launch binds the real size into the argument slot for that call | [#4964](https://github.com/torch-spyre/torch-spyre/issues/4964) |
+| deeptools | a loop whose bound comes from an input argument is accepted and executed | [#4397](https://github.com/torch-spyre/torch-spyre/issues/4397), [#1522](https://github.com/torch-spyre/torch-spyre/issues/1522) |
 
-The compiler side builds and proves offline against the abstract contract, so work does not stall while the backend piece is pending. What cannot be closed offline is the end to end proof, and Section 19 says why a numerical match is not enough evidence.
+The front end builds and proves against the abstract contract, so it does not stall while the deeptools piece is pending. Bundle emission is already proven that way: a marked dimension reaches `bundle.mlir` as a derived bound with an empty symbol list, asserted on structure rather than numbers. What cannot be closed that way is the end to end proof, and Section 19 says why a numerical match is not enough evidence.
 
 ### 18.2 Stage 2, guard enforcement
 
@@ -833,7 +870,7 @@ Nothing should be exposed to vLLM or hf-adapters before this lands.
 
 Indirect access, ref [#4382](https://github.com/torch-spyre/torch-spyre/issues/4382) under epic [#866](https://github.com/torch-spyre/torch-spyre/issues/866). Symbolic shapes owns how many iterations run, indirect access owns where each iteration reads, and a symbolic-count loop over an indirect body is a valid combination. Section 14.3 has the concrete starting point, since reproducers are already filed.
 
-MoE is where the two meet, since a per-expert token count is a symbolic loop count whose source is routing rather than an input shape. Keeping the count source-agnostic is what keeps that door open. [MegaBlocks](https://arxiv.org/abs/2211.15841) reports up to 4.35x from removing the expert-capacity padding this would remove. Ref [#3565](https://github.com/torch-spyre/torch-spyre/issues/3565).
+MoE is where the two meet, since a per-expert token count is a symbolic loop count whose source is routing rather than an input shape. Keeping the count source-agnostic is what keeps that door open. [MegaBlocks](https://arxiv.org/abs/2211.15841) reports up to 4.35x from removing the expert-capacity padding this would remove. The MoE enablement issue itself is closed, so this is a follow-on to raise when Phase 1 lands rather than a live dependency.
 
 ### 18.4 Stage 4, optimisations
 
@@ -854,15 +891,17 @@ So acceptance asserts **structure**, not only numbers. Four properties at once:
 - an SDSC describing the tile, with no symbol in it
 - an empty symbol list on the execute node
 
-That runs with no hardware and is how the compiler side is proven before the backend support lands. The on-pod gate is then one compiled kernel, several real sizes, all correct, no recompile.
+That runs with no hardware and is how the front end is proven before the deeptools support lands. The on-pod gate is then one compiled kernel, several real sizes, all correct, no recompile.
 
 ## 20. Risks and open items
 
-**In the compiler front end.** The tile extent is a sympy expression and not an int, so any integer type check or interval reasoning on it will misbehave. The tail contract depends on the caller reading only what it asked for, and if a caller forgets, the wrong answer is silent, so it needs a test on their side too. The tile advance must stay in static geometry and never become a bundle symbol.
+**In the front end.** The tile extent is a sympy expression and not an int, so any integer type check or interval reasoning on it will misbehave. The tail contract depends on the caller reading only what it asked for, and if a caller forgets, the wrong answer is silent, so it needs a test on their side too. The tile advance must stay in static geometry and never become a bundle symbol.
 
-**Elsewhere in torch-spyre.** Automatic tiling is out of scope in the WSR 2.0 first cut, so the bridge and its entry point are settled within the team as part of this work. The hint-carrying metadata is being removed by the attention rework. The symbolic stick dimension gap of Section 6.1 is unticketed.
+**Region selection is the open design question.** The insertion mechanism is settled and already used by the SDPA decomposition. What is not settled is how much graph goes inside one loop. Too little and the loop overhead and the HBM re-reads eat the benefit, too much and the region stops being tile-local and has to be refused. Phase 1 uses the narrow rule in Section 8.3 and leaves widening to the cost model in Stage 4.
 
-**Backend and runtime.** The device loop is the hard dependency and the golden example has not landed. Both sides must land before either delivers value.
+**Two symbolic mechanisms are in flight at once.** The dimension correction route ([#4370](https://github.com/torch-spyre/torch-spyre/issues/4370)) puts a dimension symbol in the SuperDSC symbol table so a host correction can read it per launch. A map-mode kernel from this design must not acquire a symbol id that way or invariant 1 is gone and the per-dispatch cost comes back. The rule in Section 6.1 needs to be agreed and then enforced by a test, not by convention.
+
+**deeptools.** The device loop is the one hard external dependency and the example bundle has not landed. Whether a dimension symbol can be ingested at all is still an open question on [PR #4911](https://github.com/torch-spyre/torch-spyre/pull/4911).
 
 ## 21. References
 

@@ -1,4 +1,4 @@
-# Symbolic Shapes: High-Level Design
+# torch-spyre Symbolic Shapes Support: High-Level Design
 
 **Status:** draft for review
 
@@ -23,7 +23,7 @@ How torch-spyre compiles a model once and runs it at many input sizes without re
 | Trip count | how many tiles run. This is the only thing that varies |
 | Planning extent | the maximum size, used for every geometry and allocation decision |
 | `for_each_tile` | the WSR 2.0 higher-order op that expresses a tiled loop in the graph |
-| Bridge | our pass that turns a marked dynamic dimension into a `for_each_tile`. This is the main new component |
+| Bridge | our pass that turns a marked dynamic dimension into a `for_each_tile`. This is the main new work, and it is proposed rather than built |
 | Phase 1 | the first delivery, where the varying axis is an outer axis and every tile is independent |
 | Phase 2 | the second delivery, where the varying axis is also a reduction axis, which is harder. Section 5 explains the line between them |
 
@@ -76,9 +76,9 @@ flowchart TB
 
 ## 3. The core idea
 
-A symbol is cheap only when it lives in a **loop count**. If it reaches an address or a stride, the host rewrites the device program at dispatch, and that correction costs high microseconds per dispatch, per kernel, synchronously.
+The varying size must not reach address arithmetic. Addresses are already runtime symbols and the host patches them when the allocation changes, which is fine because that happens rarely. An address computed from the varying size would change on **every** call instead, so the patching would move onto every dispatch.
 
-So the job is to confine the symbol to the trip count.
+So the job is to confine the varying size to the trip count.
 
 ```mermaid
 flowchart TB
@@ -165,31 +165,13 @@ Technically much deeper. The sequence sits on both axes of the score matrix and 
 
 ## 6. Where a symbol may legally live
 
-A runtime varying value can land in four places, and each has a fixed answer.
+A runtime varying value can land in three places, and each has a fixed answer.
 
 | Role | What it means | Status | Why |
 |---|---|---|---|
 | Outer extent | how many independent pieces of work exist along an axis | **supported, Phase 1** | becomes the loop trip count, the one place a symbol is cheap |
 | Reduction extent | how many values fold together into one | **Phase 2** | needs a carry across iterations, a defined pad, and the true length as data |
 | Index or table length | the length of an index tensor, or the table it reads | **separate track**, ref [#4382](https://github.com/torch-spyre/torch-spyre/issues/4382) | an index length is an outer extent again, a table length is only a range constraint and needs no loop |
-| Address or stride component | the value participates in computing where data sits | **ruled out by cost** | see below |
-
-### 6.1 Symbolic addresses, and the correction route
-
-The backend does support symbolic addresses. There is an agreed interface for it and the earlier design went that way, ref [#2289](https://github.com/torch-spyre/torch-spyre/issues/2289). The front end would emit either per-core symbolic start addresses or one base symbol plus formulas for the backend to evaluate.
-
-We are not taking it for the loop-count case, for one measured reason. Passing symbols to the execute node puts every dispatch on the host program correction path, which rewrites the binary before each launch at high microseconds per dispatch, per kernel, synchronously. That cost is paid on every call forever, and it is larger than the recompile cost we are trying to remove.
-
-There is separate work in flight that does build the correction route for dimensions, ref [#4370](https://github.com/torch-spyre/torch-spyre/issues/4370) with [PR #4911](https://github.com/torch-spyre/torch-spyre/pull/4911) and [PR #4993](https://github.com/torch-spyre/torch-spyre/pull/4993). It resolves a dimension symbol per launch through the SuperDSC symbol table so a host correction can read it. That is not a competing answer to the same question, it is the mechanism for the cases a loop bound cannot express, indirect access and strided scatter being the live ones.
-
-The two have to stay separated by one rule, because they disagree about the execute node's symbol list and our whole cost argument rests on that list staying empty for a map-mode kernel.
-
-| Question | Mechanism |
-|---|---|
-| How many independent pieces of work are there | loop count, bundle `input_arg`, no symbol on the execute node |
-| Where does a given piece read or write | dimension symbol, correction route, symbol on the execute node and the cost that comes with it |
-
-A kernel built by this design answers only the first, so it must not acquire a symbol id along the way. Reconciling the two is an open item, Section 20.
 
 ## 7. The contract
 
@@ -209,7 +191,7 @@ Core division is not on that list. Work division operates on the loop body, whic
 
 | # | Invariant | What breaks if violated |
 |---|---|---|
-| 1 | No symbol reaches an address, a stride, or the execute node's symbol list | the correction path is gated on that list, so every dispatch pays high microseconds |
+| 1 | No address or stride is computed from the varying dimension | addresses are patched once per allocation. One derived from the size changes every call, so the patching moves onto every dispatch |
 | 2 | **The SDSC describes one tile and is fully static** | the tile is the loop body, so its geometry is the tile size. The maximum belongs in the bundle argument and in the HBM layout, not in the SDSC |
 | 3 | The runtime size is within range and a multiple of the granularity | the tile count floor silently drops the tail and the answer is quietly wrong |
 | 4 | One symbolic count per kernel per nesting level | two independently marked operands give two symbols and two counts, which cannot be launched |
@@ -237,12 +219,56 @@ Rules. `max` must be a multiple of `granularity`. `min` must be at least 2, sinc
 |---|---|---|
 | Bundle `input_arg` | `granularity` and `max_value` for the symbol, read as the loop bound | torch-spyre to deeptools |
 | SDSC | one tile, fully static geometry | torch-spyre to deeptools |
-| `sdsc_execute` symbol list | stays empty, see invariant 1 | torch-spyre to deeptools |
+| `sdsc_execute` symbol list | the symbolic addresses it already carries, and no dimension symbol | torch-spyre to deeptools |
 | Launch | the real size bound into an argument slot | torch-spyre runtime, per dispatch |
 
 The single source of truth for granularity and max is the bundle input argument. deeptools has confirmed it will derive the SDSC-side values from there rather than requiring us to fill them twice.
 
-We pass the size and not the trip count. The tile size is a per-kernel decision the compiler makes, so only the compiler can turn a size into a count, and the device already has to hold the bound as a value anyway. The division lands in the bundle as a `ceildivsi`, which deeptools is adding.
+### 7.5 The bundle we emit
+
+Worked through with deeptools. Dim 0 varies from 64 to 512 with granularity 64, so the tile is 64 rows, and `z = x + y` on `(S, 1024)` fp16 gives:
+
+```mlir
+#map_0 = affine_map<(d0)[s0] -> (s0 + d0 * 131072)>
+
+func.func @sdsc_bundle(
+    %arg_0_base_addr: !sdscbundle.input_arg<index>,
+    %arg_1_base_addr: !sdscbundle.input_arg<index>,
+    %arg_2_base_addr: !sdscbundle.input_arg<index>,
+    %dim_s0_base: !sdscbundle.input_arg<index, granularity=64, max_value=512>) {
+
+  %arg_0 = sdscbundle.input_arg_extract value from %arg_0_base_addr
+      : !sdscbundle.input_arg<index> -> index
+  %dim_s0 = sdscbundle.input_arg_extract value from %dim_s0_base
+      : !sdscbundle.input_arg<index, granularity=64, max_value=512> -> index
+
+  %tile_0 = arith.constant 64 : index
+  %loop_bound_0 = arith.ceildivsi %dim_s0, %tile_0 : index
+
+  scf.for %i_0 = %c0 to %loop_bound_0 step %c1 {
+    %addr_0 = affine.apply #map_0(%i_0)[%arg_0]
+    %addr_1 = affine.apply #map_0(%i_0)[%arg_1]
+    %addr_2 = affine.apply #map_0(%i_0)[%arg_2]
+    sdscbundle.sdsc_execute (%addr_0, %addr_1, %addr_2)
+        {sdsc_filename="sdsc_0.json", "symbol_ids"=[...]}
+  }
+  return
+}
+```
+
+The three address parameters are on every bundle today and `symbol_ids` carries them as it always has. The fourth parameter is the only thing this feature adds, and it is recognisable because it is the only one with `granularity` and `max_value` on it.
+
+The `131072` in the affine map is the tile stride, `64 * 1024 * 2` bytes. It is a constant and it does not depend on S, which is what invariant 1 is about. The SDSC beside this describes one 64 x 1024 tile and is fully static.
+
+#### Why granularity rides in the bundle
+
+It is the contract, written once where both sides read it. `granularity` says which sizes this binary serves and `max_value` says what the geometry was planned for. Putting it on the argument means neither side keeps a second copy that can drift.
+
+#### Why we send the size and not the loop count
+
+The tile size is a per-kernel decision. The cost model picks it from what fits LX for that kernel, so two kernels in the same graph can tile the same dimension differently.
+
+Take S of 512, with a pointwise kernel tiling at 64 and a matmul tiling at 128. The counts are 8 and 4. If the host sent counts, it would have to know every kernel's tile size and send a different number to each one. Sending 512 once lets each bundle do its own `ceildivsi`.
 
 ## 8. WSR 2.0, and where the symbolic bridge sits
 
@@ -298,14 +324,16 @@ The piece that turns a marked dynamic dimension into a tiled loop is the bridge,
 
 Where it sits is already decided by how `for_each_tile` works. It is not a graph node. It is ordinary Python in `wsr/for_each_tile.py` that builds a `combine_fn` and calls `scan`, so no pass can insert it as a node. What can call it is a decomposition, while AOT is tracing. The SDPA decomposition already does that in two places in `_inductor/decompositions.py`, and `for_each_tile` carries an explicit branch for being reached that way instead of through Dynamo.
 
-So the bridge is two pieces and only the first one is new.
+So the bridge is two pieces. **Both are proposed, not built.** The op name below is a placeholder.
 
 | Piece | Where it goes | Status |
 |---|---|---|
-| Region selection: pick the ops that should share one loop, lift them into a submodule, replace them with a single `spyre.tiled_region` call | `CustomPreGradPasses`, the pre-grad FX extension point, empty today | new |
-| Loop construction: a decomposition of `spyre.tiled_region` that calls `for_each_tile` with `tile_size` set to the granularity | `_inductor/decompositions.py`, next to the SDPA ones | existing pattern |
+| Region selection: pick the ops that should share one loop, lift them into a submodule, replace them with a single `spyre.tiled_region` call | `CustomPreGradPasses`, the pre-grad FX extension point, empty today | proposed |
+| Loop construction: a decomposition of `spyre.tiled_region` that calls `for_each_tile` with `tile_size` set to the granularity | `_inductor/decompositions.py`, next to the SDPA ones | proposed, on an existing pattern |
 
 Pre-grad and not post-grad, because decompositions run during AOT tracing and a post-grad pass is past that point.
+
+Region selection is modelled on `hints_to_coarse_tile_groups` in `wsr/coarse_tile_hints.py`, which already does this for the WSR 1.0 hint path: walk in topological order, collect consecutive ops that agree, break when they stop agreeing, hand out `(ops, levels)` groups. Same algorithm, different key. That one keys on a `spyre_hint()` the model author wrote, ours keys on the marked dimension.
 
 ```mermaid
 flowchart TB
@@ -329,17 +357,31 @@ A fully static model never enters either piece and compiles exactly as it does t
 
 #### Why a region and not one op at a time
 
-A decomposition registered on `aten.add` would give one loop per add. Separate `for_each_tile` calls get separate loop group ids, and the scheduler groups by that id, so `x + y` then `* 2` then `gelu` would become three sequential device loops each re-reading its tile from HBM. That is the opposite of working set reduction. The region has to be chosen before the loop is built, which is why selection is a pass and not a decomposition.
+A decomposition registered on `aten.add` would give one loop per add, since separate `for_each_tile` calls get separate loop group ids and the scheduler groups by that id.
+
+The cost of that is the whole point. Take the small network of Section 9.5. As one region it is:
+
+```python
+for i in range(S // 64):
+    h = relu(x_tile @ W1 + b1)          # (64, 512), lives in LX
+    y_tile = softmax(h @ W2 + b2, -1)
+```
+
+`h` is born and consumed inside one trip and never reaches HBM. Split the same graph into four loops and `h` is written out at 64 x 512 and read back, once per trip, for no reason. The weights get re-staged four times over instead of once. That is the working set reduction this construct exists to deliver, and it is only available if the grouping decision is made before the loop is built. Hence a pass, not a decomposition.
 
 The Phase 1 rule is deliberately narrow.
 
 | Step | Action |
 |---|---|
 | 1 | seed from inputs whose fake value carries a marked symbol |
-| 2 | grow forward while every op is pointwise or a broadcast and the marked axis passes through one to one |
+| 2 | grow forward while the marked axis passes through one to one |
 | 3 | stop at the first reduction along that axis, reshape across it, or matmul contraction on it |
 | 4 | emit an equality check for operands sharing the axis, invariant 4 |
 | 5 | lift the region and hand the granularity through as `tile_size` |
+
+Step 2 is about the axis, not the op class, so a matmul whose varying axis is the outer one stays in the region. That is what lets the whole of Section 9.5 be a single loop.
+
+How far to grow is bounded by LX, not by the graph. Every operand co-live in a trip has to fit, and `estimated_live_bytes_per_core` in the SDPA decomposition is the existing check for exactly that. A wider region needs a smaller tile, which means more trips, so the two trade against each other. Phase 1 takes the narrow rule and leaves the trade to the cost model, Section 13.
 
 If the region's inputs do not share one symbol on that axis, refuse the region and leave the graph alone. An unhandled shape then degrades to today's behaviour instead of failing the compile. Reduction mode lands later as a second branch at step 3.
 
@@ -605,7 +647,6 @@ Everything below the dispatcher is band blind. Each band is an ordinary compiled
 
 Choosing a granularity automatically, rather than taking the one the user gave, is a separate optimisation and is covered in Section 13.
 
-The one constraint on G that is live today is the alignment condition of Section 6.1, and it only applies if the stick axis is ever marked.
 
 ### 11.2 Why the addresses stay static
 
@@ -799,17 +840,17 @@ The distinction the host makes at dispatch is the whole game.
 ```mermaid
 flowchart TB
   v["Runtime-varying value"] --> q{"Where does it land?"}
-  q -->|"address or stride"| corr["program correction"]
-  q -->|"loop count"| bind["argument binding"]
+  q -->|"an address derived from it"| corr["patched every dispatch"]
+  q -->|"the loop count"| bind["bound once per launch"]
   classDef bad fill:#f3ddd9,stroke:#a5342b;
   classDef good fill:#dcefe0,stroke:#2f7a44;
   class corr bad
   class bind good
 ```
 
-Argument binding fills a value into a slot the program reads at launch, and the body is untouched. Program correction re-derives a value baked into the body and rewrites the binary, at high microseconds per dispatch. Keeping the symbol in the loop count is what keeps us on the first path.
+Argument binding fills a value into a slot the program reads at launch and leaves the body alone. Patching rewrites values baked into the body before the launch.
 
-Two facts hold the contract together. The execute node keeps its symbol list empty, because the correction path is gated exactly on that list. And addresses carry no symbols.
+Base addresses are patched either way, that is normal and it is not what this design changes. What matters is how often. Our tile addresses are `base + i * constant`, and the constant is the tile stride, which does not depend on the varying dimension. So a different size on the next call does not invalidate anything that was already patched.
 
 What crosses the boundary is the size, not the count, for the reason in Section 7.4. The bundle derives the bound with a `ceildivsi`, which deeptools is adding.
 
@@ -821,7 +862,7 @@ That example is what unblocks emission, ref [#4380](https://github.com/torch-spy
 
 | Alternative | Why not |
 |---|---|
-| Symbolic addresses in the SDSC | deeptools supports it and an interface exists, ref [#2289](https://github.com/torch-spyre/torch-spyre/issues/2289). But it puts every dispatch on the host correction path at high microseconds per kernel, forever. That is worse than the recompile cost we are removing |
+| Deriving addresses from the varying dimension, ref [#2289](https://github.com/torch-spyre/torch-spyre/issues/2289) | the address of every tile then changes with the size, so the program is patched on every dispatch instead of once per allocation |
 | Bucketing, a binary per size band | multiplies cold compile time and binary count, and still pads. It is the thing this design replaces, not a fallback |
 | Specialising the trip count to an integer and compiling a variant per count | works on today's deeptools with no new support, and is implemented in [PR #4684](https://github.com/torch-spyre/torch-spyre/pull/4684). But the compile happens on the dispatch path, so an unseen count stalls a forward pass, the variant set grows with the data and is never evicted, and it declines map mode with stacked outputs by name, which is our dynamic batch case. It keeps the count inside the binary, so it does not reach one binary for a range |
 | Making the granularity structural in the reshape | does not work. Every reshape spelling produces the same divided expression, see Appendix A |
@@ -858,7 +899,7 @@ Four things have to be true for one binary to serve a range, and none of them de
 | torch-spyre runtime | the launch binds the real size into the argument slot for that call | [#4964](https://github.com/torch-spyre/torch-spyre/issues/4964) |
 | deeptools | a loop whose bound comes from an input argument is accepted and executed | [#4397](https://github.com/torch-spyre/torch-spyre/issues/4397), [#1522](https://github.com/torch-spyre/torch-spyre/issues/1522) |
 
-The front end builds and proves against the abstract contract, so it does not stall while the deeptools piece is pending. Bundle emission is already proven that way: a marked dimension reaches `bundle.mlir` as a derived bound with an empty symbol list, asserted on structure rather than numbers. What cannot be closed that way is the end to end proof, and Section 19 says why a numerical match is not enough evidence.
+The front end builds and proves against the abstract contract, so it does not stall while the deeptools piece is pending. Bundle emission is already proven that way: a marked dimension reaches `bundle.mlir` as a derived loop bound, asserted on structure rather than numbers. What cannot be closed that way is the end to end proof, and Section 19 says why a numerical match is not enough evidence.
 
 ### 18.2 Stage 2, guard enforcement
 
@@ -884,12 +925,11 @@ Reductions and matmul on the varying axis, refs [#3062](https://github.com/torch
 
 A binary compiled at the static maximum produces numerically correct results at every smaller size. It passes a CPU comparison, runs clean, and looks exactly like success. It is also the complete absence of the feature.
 
-So acceptance asserts **structure**, not only numbers. Four properties at once:
+So acceptance asserts **structure**, not only numbers. Three properties at once:
 
 - a live symbolic loop bound in the emitted bundle, fed from an input argument, not a constant
-- static addresses with no authored division
-- an SDSC describing the tile, with no symbol in it
-- an empty symbol list on the execute node
+- tile addresses that advance by a constant stride, with no authored division and nothing derived from the varying dimension
+- an SDSC describing one tile, carrying the addresses it always did and no dimension symbol
 
 That runs with no hardware and is how the front end is proven before the deeptools support lands. The on-pod gate is then one compiled kernel, several real sizes, all correct, no recompile.
 
@@ -899,7 +939,7 @@ That runs with no hardware and is how the front end is proven before the deeptoo
 
 **Region selection is the open design question.** The insertion mechanism is settled and already used by the SDPA decomposition. What is not settled is how much graph goes inside one loop. Too little and the loop overhead and the HBM re-reads eat the benefit, too much and the region stops being tile-local and has to be refused. Phase 1 uses the narrow rule in Section 8.3 and leaves widening to the cost model in Stage 4.
 
-**Two symbolic mechanisms are in flight at once.** The dimension correction route ([#4370](https://github.com/torch-spyre/torch-spyre/issues/4370)) puts a dimension symbol in the SuperDSC symbol table so a host correction can read it per launch. A map-mode kernel from this design must not acquire a symbol id that way or invariant 1 is gone and the per-dispatch cost comes back. The rule in Section 6.1 needs to be agreed and then enforced by a test, not by convention.
+**A second symbolic mechanism is in flight.** [#4370](https://github.com/torch-spyre/torch-spyre/issues/4370) resolves a dimension symbol per launch through the SuperDSC symbol table, for cases a loop bound cannot express such as indirect access. It is not a competing answer, but the two need to stay separable so a kernel of this shape does not pick up a dimension symbol it does not need.
 
 **deeptools.** The device loop is the one hard external dependency and the example bundle has not landed. Whether a dimension symbol can be ingested at all is still an open question on [PR #4911](https://github.com/torch-spyre/torch-spyre/pull/4911).
 

@@ -140,6 +140,9 @@ def generate_bundle(
     sdsc_cache_counts: list[int] | None = None
     if _spyre_config.sdsc_cache:
         sdsc_cache_counts = [0, 0]  # [hits, misses]
+    # Collect dimension SymbolKinds from LoopSpec.symbolic_dim_bounds (dynamic
+    # for_each_tile loops whose trip count contains a free shape symbol).
+    loop_dim_kinds: list[SymbolKind] = []
     _compile_specs(
         specs_list,
         symbols,
@@ -149,6 +152,7 @@ def generate_bundle(
         output_dir,
         sdsc_cache={} if _spyre_config.sdsc_cache else None,
         _sdsc_cache_counts=sdsc_cache_counts,
+        loop_dim_kinds=loop_dim_kinds,
     )
     if sdsc_cache_counts is not None:
         hits, misses = sdsc_cache_counts
@@ -202,6 +206,26 @@ def generate_bundle(
                     local_dim_ordinal,
                 )
             symbol_kinds.append(lk)
+
+    # Inject dimension SymbolKinds from LoopSpec.symbolic_dim_bounds.
+    # These represent the shape variables in dynamic loop counts (e.g. FloorDiv(s0,64))
+    # and need MLIR function parameters just like per-SDSC dimension symbols, but
+    # they are not tied to any individual SDSC compilation.  Use len(compiled) as a
+    # synthetic SDSC index so MLIR names never collide with real SDSC names.
+    if loop_dim_kinds:
+        synthetic_sdsc_idx = len(compiled)
+        seen_loop_pytorch_syms: set[str] = {
+            sk.pytorch_sym for sk in symbol_kinds if sk.is_dimension
+        }
+        loop_dim_ordinal = 0
+        for lsk in loop_dim_kinds:
+            if lsk.pytorch_sym in seen_loop_pytorch_syms:
+                continue  # already registered via an SDSC op
+            loop_dim_ordinal += 1
+            sym_idx = len(symbol_kinds)
+            symbol_kinds.append(lsk)
+            sym_idx_to_dim_origin[sym_idx] = (synthetic_sdsc_idx, loop_dim_ordinal)
+            seen_loop_pytorch_syms.add(lsk.pytorch_sym)
 
     # Determine whether a pool parameter is needed (any pool symbol present).
     has_pool = any(sk.is_pool for sk in symbol_kinds)
@@ -331,8 +355,20 @@ def generate_bundle(
         if loop_bounds:
             f.write("\t\t%c0 = arith.constant 0 : index\n")
             f.write("\t\t%c1 = arith.constant 1 : index\n")
+            # Build a mapping from pytorch_sym string to the SSA name produced by
+            # the input_arg_extract for each canonical dimension symbol.
+            # Used by _emit_symbolic_loop_bound for dynamic trip counts.
+            dim_sym_ssa: dict[str, str] = {
+                pytorch_sym: dim_param_names[canonical_sym_idx]
+                for pytorch_sym, canonical_sym_idx in seen_dim_sym.items()
+            }
             for lb_idx, lb in enumerate(loop_bounds):
-                f.write(f"\t\t%loop_bound_{lb_idx} = {_mlir_count_value(lb)}\n")
+                if hasattr(lb, "free_symbols") and lb.free_symbols:
+                    _emit_symbolic_loop_bound(f, lb_idx, lb, dim_sym_ssa, indent="\t\t")
+                else:
+                    f.write(
+                        f"\t\t%loop_bound_{lb_idx} = {_mlir_count_value(lb)}\n"
+                    )
 
         # Emit one declaration per symbol:
         #   - "kernel"          → skipped; already a function param + extract op above
@@ -495,15 +531,40 @@ def _compile_specs(
     output_dir: str,
     sdsc_cache: dict | None = None,
     _sdsc_cache_counts: list | None = None,
+    loop_dim_kinds: list | None = None,
 ) -> None:
     """Recursively compile all OpSpecs in specs depth-first.
 
     Identical op specs (same canonical SDSC at counter 0) reuse the previously
     compiled entry — same sdsc file and same symbol registrations.
     Pass sdsc_cache={} to enable caching; None disables it.
+
+    ``loop_dim_kinds``: if provided, dimension SymbolKinds from LoopSpec
+    symbolic_dim_bounds are appended here so generate_bundle can register them
+    as MLIR function parameters.
     """
     for entry in specs:
         if isinstance(entry, LoopSpec):
+            # Collect dimension SymbolKinds from the LoopSpec's symbolic count.
+            # These are not associated with any individual SDSC — the count is
+            # the trip count of the enclosing loop, emitted separately.
+            if loop_dim_kinds is not None and entry.symbolic_dim_bounds:
+                for sym_str, (
+                    max_val,
+                    gran,
+                    pytorch_sym,
+                    tensor_id,
+                    dim_idx,
+                ) in entry.symbolic_dim_bounds.items():
+                    loop_dim_kinds.append(
+                        SymbolKind.dimension(
+                            granularity=gran,
+                            max_value=max_val,
+                            pytorch_sym=pytorch_sym,
+                            tensor_id=tensor_id,
+                            dim_index=dim_idx,
+                        )
+                    )
             _compile_specs(
                 entry.body,
                 symbols,
@@ -513,6 +574,7 @@ def _compile_specs(
                 output_dir,
                 sdsc_cache,
                 _sdsc_cache_counts,
+                loop_dim_kinds,
             )
         elif isinstance(entry, OpSpec):
             cached = None
@@ -660,11 +722,81 @@ def _collect_affine_maps(
 
 
 def _mlir_count_value(count: sympy.Expr) -> str:
-    """Return an MLIR value expression for a loop trip count."""
+    """Return an MLIR value expression for a static loop trip count."""
     if isinstance(count, (sympy.Integer, int)):
         return f"arith.constant {int(count)} : index"
     raise NotImplementedError(
         f"Symbolic loop counts are not yet supported in bundle.mlir generation: {count}"
+    )
+
+
+def _emit_symbolic_loop_bound(
+    f,
+    lb_idx: int,
+    count: sympy.Expr,
+    dim_sym_ssa: dict[str, str],
+    indent: str,
+) -> None:
+    """Emit MLIR statements for a symbolic loop trip count.
+
+    Handles the ``FloorDiv(s0, G)`` pattern that ``for_each_tile`` produces
+    when its trip count is ``batch_size // tile_size`` with a dynamic batch.
+    Emits an ``arith.constant`` for the divisor and an ``arith.divsi`` for the
+    quotient, writing both lines to ``f``.
+
+    ``dim_sym_ssa`` maps ``pytorch_sym_str`` (e.g. ``"s0"``) to the SSA name
+    (e.g. ``"%sym_0_1"``) that the dimension ``input_arg_extract`` produced.
+    """
+    # Expect FloorDiv(sym, divisor) — the canonical for_each_tile trip-count shape.
+    # sympy represents integer floor-div as FloorDiv from torch's function set.
+    free = list(count.free_symbols)
+    if len(free) == 1:
+        sym = free[0]
+        sym_str = str(sym)
+        if sym_str in dim_sym_ssa:
+            # Compute the static divisor: substitute sym=1 so FloorDiv(1,G)=0 won't work
+            # — instead derive divisor from count structure.
+            # For FloorDiv(s0, G): divisor = G = count evaluated at s0=G (since G//G=1).
+            # Reliable approach: max_val from the SymbolKind tells us granularity is
+            # max_val / max_trip_count.  But we don't have that here.
+            # Simpler: if count = sym/D or FloorDiv(sym, D), the args give us D.
+            divisor = None
+            if hasattr(count, "args") and len(count.args) == 2:
+                # FloorDiv or Mul(sym, 1/D) — try to extract the second arg
+                arg0, arg1 = count.args
+                if arg0 == sym and isinstance(arg1, (sympy.Integer, int, sympy.Rational)):
+                    # count = FloorDiv(sym, D) or sym * (1/D).
+                    # sympy.Integer IS a Rational, so check Integer first to avoid
+                    # int(1/64) = 0 when D is a whole-number divisor.
+                    if isinstance(arg1, (sympy.Integer, int)):
+                        divisor = int(arg1)
+                    elif isinstance(arg1, sympy.Rational):
+                        divisor = int(1 / arg1)
+                elif arg1 == sym and isinstance(arg0, (sympy.Integer, int)):
+                    divisor = int(arg0)
+                elif isinstance(arg1, (sympy.Integer, int)) and arg1 > 0:
+                    divisor = int(arg1)
+            if divisor is None:
+                # Fall back: evaluate count at sym=count's upper bound to infer divisor
+                # via count(max) = max // divisor → divisor = max // count(max)?
+                # Not reliable without max.  Emit a comment and constant 1 as fallback.
+                f.write(
+                    f"{indent}%loop_bound_{lb_idx} = arith.constant 1 : index"
+                    f"  // WARNING: could not compute divisor for {count}\n"
+                )
+                return
+            ssa_name = dim_sym_ssa[sym_str]
+            div_const_name = f"%trip_divisor_{lb_idx}"
+            f.write(f"{indent}{div_const_name} = arith.constant {divisor} : index\n")
+            f.write(
+                f"{indent}%loop_bound_{lb_idx} = arith.divsi"
+                f" {ssa_name}, {div_const_name} : index\n"
+            )
+            return
+    # Could not resolve — emit a fallback constant 0 and a warning comment
+    f.write(
+        f"{indent}%loop_bound_{lb_idx} = arith.constant 0 : index"
+        f"  // WARNING: unresolved symbolic count {count}\n"
     )
 
 

@@ -104,6 +104,8 @@ class SymbolKind:
     # Only meaningful for the kernel_derived_symbolic variant.
     core_idx: int = -1
     split_count: int = 0
+    # For the dimension variant: which dimension of the tensor to read at runtime.
+    dim_index: int = 0
 
     @classmethod
     def kernel(cls, arg_index: int) -> "SymbolKind":
@@ -155,13 +157,20 @@ class SymbolKind:
 
     @classmethod
     def dimension(
-        cls, granularity: int, max_value: int, pytorch_sym: str
+        cls,
+        granularity: int,
+        max_value: int,
+        pytorch_sym: str,
+        tensor_id: int = -1,
+        dim_index: int = 0,
     ) -> "SymbolKind":
         return cls(
             kind="dimension",
             granularity=granularity,
             max_value=max_value,
             pytorch_sym=pytorch_sym,
+            arg_index=tensor_id,
+            dim_index=dim_index,
         )
 
     @property

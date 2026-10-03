@@ -143,10 +143,19 @@ void JobPlanStepHostCompute::construct(LaunchContext& ctx,
         TORCH_CHECK(sym.tensor_id >= 0 && static_cast<size_t>(sym.tensor_id) <
                                               ctx.inputs_outputs.size(),
                     "symbolic_args tensor_id out of range");
-        TORCH_CHECK(sym.kind == SymbolicArgKind::kAddress,
-                    "SymbolicArgKind::kDimension is not yet implemented");
-        args.push_back(
-            get_composite_address(ctx.inputs_outputs[sym.tensor_id]));
+        if (sym.kind == SymbolicArgKind::kAddress) {
+          args.push_back(
+              get_composite_address(ctx.inputs_outputs[sym.tensor_id]));
+        } else if (sym.kind == SymbolicArgKind::kDimension) {
+          TORCH_CHECK(sym.value >= 0,
+                      "kDimension SymbolicArg requires a non-negative value; "
+                      "got ",
+                      sym.value);
+          args.push_back(static_cast<int64_t>(sym.value));
+        } else {
+          TORCH_CHECK(false, "Unknown SymbolicArgKind: ",
+                      static_cast<int32_t>(sym.kind));
+        }
       }
     } else {
       // Case 3b: legacy: one Address arg per context tensor in order.

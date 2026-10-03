@@ -137,7 +137,47 @@ def _patch_tensor_for_spyre():
         else:
             return None
 
-    def spyre_to(self, *args, device_layout=None, max=None, **kwargs):
+    def spyre_to(self, *args, device_layout=None, max=None, dynamic=None, **kwargs):
+        if dynamic is not None:
+            # tensor.to("spyre", dynamic={dim: {"min": G, "max": M, "granularity": G}})
+            # Allocates at max along the dynamic dim, copies the data, and calls
+            # torch._dynamo.mark_dynamic so the compiled graph sees a SymInt with
+            # range [granularity, max_val] and emits a dimension input_arg in the
+            # bundle.  ``mark_dynamic`` must be called BEFORE torch.compile.
+            _device = kwargs.get("device", None)
+            if (
+                _device is None
+                and len(args) > 0
+                and isinstance(args[0], (str, torch.device))
+            ):
+                _device = args[0]
+            TORCH_CHECK_DYN_MSG = (
+                'dynamic= is only supported for CPU -> "spyre" transfers, e.g. '
+                'x.to("spyre", dynamic={0: {"min": 64, "max": 576}})'
+            )
+            if _device is None or torch.device(_device).type != DEVICE_NAME:
+                raise ValueError(TORCH_CHECK_DYN_MSG)
+            if self.device.type != "cpu":
+                raise ValueError(TORCH_CHECK_DYN_MSG)
+
+            if not torch.spyre.is_initialized():
+                torch.spyre._impl._lazy_init()
+
+            from torch_spyre._C import copy_tensor, spyre_empty_reserved
+
+            # Allocate one tensor per dynamic dim (only dim 0 supported in Phase 1).
+            # Reserve space at max_val; logical size stays at self.size()[dim].
+            dst = self
+            for dim, spec in dynamic.items():
+                gran = spec.get("granularity", spec.get("min", 1))
+                max_val = spec["max"]
+                dst = spyre_empty_reserved(dst.size(), dst.stride(), dst.dtype, dim, max_val)
+                copy_tensor(self, dst, non_blocking=False)
+                # mark_dynamic encodes the range [gran, max_val] so the compiled
+                # graph sees a SymInt and emits a dimension input_arg.
+                torch._dynamo.mark_dynamic(dst, dim, min=gran, max=max_val)
+            return dst
+
         if max is not None:
             # tensor.to("spyre", max=512): reserve the destination buffer
             # at `max` along dim 0 instead of the current (warmup) shape,

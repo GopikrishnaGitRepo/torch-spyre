@@ -225,6 +225,12 @@ def _extract_trip_count(cond_graph) -> sympy.Expr | None:
     bound = recorder.constants[0]
     if isinstance(bound, bool):
         return None
+    # SymInt (from a dynamic for_each_tile trip count): extract the underlying
+    # sympy expression so the rest of the lowering pipeline sees a sympy.Expr.
+    import torch as _torch
+
+    if isinstance(bound, _torch.SymInt):
+        bound = bound.node.expr
     if not isinstance(bound, (int, sympy.Expr)):
         return None
     return sympy.sympify(bound)

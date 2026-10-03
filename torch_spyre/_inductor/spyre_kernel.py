@@ -63,6 +63,7 @@ from .scratchpad.lx_relayout import (
 )
 from .pass_utils import (
     concretize_expr,
+    compute_granularity,
     compute_symbolic_bounds,
     finite_upper_or_none,
     iteration_space,
@@ -999,7 +1000,18 @@ class SpyreKernel(Kernel[CSEVariable]):
                     level_syms.append(self._get_or_mint_level_symbol(lvl, op_name))
                 tiled_syms_per_level_outermost.append(level_syms)
                 if lvl < len(loop_count):
-                    trip_count = int(loop_count[lvl])
+                    tc = loop_count[lvl]
+                    if hasattr(tc, "free_symbols") and tc.free_symbols:
+                        # Symbolic trip count (e.g. FloorDiv(s0, 64)) — substitute
+                        # max values so SDSC codegen sees a concrete upper bound.
+                        subs = {
+                            sym: finite_upper_or_none(sym) or sym
+                            for sym in tc.free_symbols
+                            if finite_upper_or_none(sym) is not None
+                        }
+                        trip_count = int(tc.subs(subs)) if subs else int(tc)
+                    else:
+                        trip_count = int(tc)
                     for sym in level_syms:
                         tiled_symbol_trip_counts[sym] = trip_count
             # Reverse so index 0 = innermost level.
@@ -1372,7 +1384,16 @@ class SpyreKernel(Kernel[CSEVariable]):
     def wrap_op_specs_in_loop(self, count: sympy.Expr) -> None:
         """Replace the current op_specs list with a single LoopSpec of the given count."""
         body = self.op_specs
-        self.op_specs = [LoopSpec(count=count, body=body)]
+        dim_bounds: dict = {}
+        if hasattr(count, "free_symbols") and count.free_symbols:
+            for sym in count.free_symbols:
+                max_val = finite_upper_or_none(sym)
+                if max_val is not None:
+                    gran = compute_granularity(sym, max_val)
+                    # tensor_id=-1: resolved to the first input tensor's arg_index
+                    # by codegen_kernel() after arg_index assignment.
+                    dim_bounds[str(sym)] = (max_val, gran, str(sym), -1, 0)
+        self.op_specs = [LoopSpec(count=count, body=body, symbolic_dim_bounds=dim_bounds)]
 
     def check_op_specs(self) -> None:
         """Validate and log the finished operation sequence after loop wrapping."""
@@ -1431,6 +1452,28 @@ class SpyreKernel(Kernel[CSEVariable]):
                     if has_pool_allocations
                     else tensor_arg.arg_index
                 ]
+
+        # Resolve tensor_ids in LoopSpec.symbolic_dim_bounds: they were set to -1
+        # in wrap_op_specs_in_loop before arg_index assignment. Use the first input
+        # tensor's arg_index (Phase 1: all inputs share the same dynamic batch dim).
+        first_input_arg_index = -1
+        for name in actuals:
+            for n, ta in self.spyre_kernel_args:
+                if n == name and ta.is_input and ta.arg_index >= 0:
+                    first_input_arg_index = ta.arg_index
+                    break
+            if first_input_arg_index >= 0:
+                break
+        if first_input_arg_index >= 0:
+            for spec in self.op_specs:
+                if isinstance(spec, LoopSpec) and spec.symbolic_dim_bounds:
+                    for sym_str in list(spec.symbolic_dim_bounds.keys()):
+                        entry = spec.symbolic_dim_bounds[sym_str]
+                        max_val, gran, pytorch_sym, tid, dim_idx = entry
+                        if tid == -1:
+                            spec.symbolic_dim_bounds[sym_str] = (
+                                max_val, gran, pytorch_sym, first_input_arg_index, dim_idx
+                            )
 
         buf = IndentedBuffer()
         buf.writeline("[")

@@ -154,10 +154,6 @@ def _compile_to_dir(
             inputSym_ slot count.
     """
     symbol_kinds = generate_bundle(kernel_name, compile_dir, specs, pool_size=pool_size)
-    if any(sk.is_dimension for sk in symbol_kinds):
-        raise NotImplementedError(
-            "SDSC bundle dimension symbols require runtime kDimension support"
-        )
     return symbol_kinds
 
 

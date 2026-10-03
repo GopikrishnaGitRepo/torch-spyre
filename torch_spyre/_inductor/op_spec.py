@@ -415,6 +415,12 @@ class LoopSpec:
         count: Trip count of the loop. May be a symbolic shape expression.
         body: The operations to execute each iteration. Each element may be
             an OpSpec, UnimplementedOp, or a nested LoopSpec.
+        symbolic_dim_bounds: Bounds for any free symbols in ``count``.
+            Populated by ``wrap_op_specs_in_loop`` when ``count`` is symbolic
+            (e.g. ``FloorDiv(s0, 64)`` from a dynamic-batch ``for_each_tile``).
+            Maps ``str(sym)`` → ``(max_value, granularity, pytorch_sym, tensor_id,
+            dim_index)`` so bundle.py can emit the MLIR dimension parameter and
+            kernel_runner.py can read the runtime value from the right tensor.
 
     Each OpSpec in the body carries its own ``tiled_symbols`` list identifying
     which of its iteration-space symbols are tiled by the loop that directly
@@ -427,6 +433,8 @@ class LoopSpec:
     # list[OpSpec | UnimplementedOp | LoopSpec], typed as Any to accommodate
     # the two distinct UnimplementedOp types (op_spec vs spyre_kernel).
     body: list[Any]
+    # Maps str(sym) -> (max_value, granularity, pytorch_sym, tensor_id, dim_index)
+    symbolic_dim_bounds: dict = dataclasses.field(default_factory=dict)
 
 
 def spyre_constant_tensor(const_val, device, dtype=torch.float16):

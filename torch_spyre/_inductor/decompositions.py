@@ -1709,11 +1709,55 @@ def spyre_topk(
     )
 
 
+def _get_dynamic_outer_dim_info(
+    tensor: torch.Tensor,
+) -> "tuple[int, int] | None":
+    """Return ``(granularity, max_val)`` if dim 0 is a user-bounded SymInt.
+
+    Reads the bounds that ``torch._dynamo.mark_dynamic(t, 0, min=G, max=M)``
+    set on the SymInt.  Returns ``None`` for static shapes or shapes with only
+    the default PyTorch lower bound (2), which is not a user-set granularity.
+    """
+    import sympy as _sympy
+
+    batch = tensor.shape[0]
+    if not isinstance(batch, torch.SymInt):
+        return None
+    node = batch.node
+    if not (hasattr(node, "shape_env") and hasattr(node, "expr")):
+        return None
+    shape_env = node.shape_env
+    expr = node.expr
+    try:
+        vr = shape_env.bound_sympy(expr)
+    except Exception:
+        return None
+    upper = vr.upper
+    if not (isinstance(upper, _sympy.Integer) and upper.is_finite and int(upper) > 0):
+        return None
+    max_val = int(upper)
+    lower = vr.lower
+    # min=2 is PyTorch's default lower bound; treat it as "not user-set"
+    if not (isinstance(lower, _sympy.Integer) and int(lower) > 2):
+        return None
+    gran = int(lower)
+    return gran, max_val
+
+
 @register_spyre_decompositions([torch.ops.aten.gelu.default])
 def spyre_gelu(
     input: torch.Tensor,
     approximate: str = "none",
 ) -> torch.Tensor:
+    dim_info = _get_dynamic_outer_dim_info(input)
+    if dim_info is not None:
+        gran, _max_val = dim_info
+
+        def _body(carry, tiles):
+            return None, torch.ops.spyre.gelu(tiles[0], approximate)
+
+        _, result = for_each_tile(_body, (input,), dims=(0,), tile_size=gran, out_dim=0)
+        return result
     return torch.ops.spyre.gelu(input, approximate)
 
 

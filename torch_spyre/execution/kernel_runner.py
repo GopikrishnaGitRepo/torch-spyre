@@ -92,31 +92,31 @@ class SpyreSDSCKernelRunner:
         # that generate_bundle() returned and stored on this runner.
         # symbol_kinds matches the MLIR input_arg slot order: pool first
         # (when frontend_pool_allocation is active), then kernel tensor
-        # args in arg_index order. The payload is invariant across launches.
+        # args in arg_index order, then dimension args.
+        # Dimension symbols get a None sentinel; they are resolved to concrete
+        # SymbolicArg(kDimension, ...) at each run() call.
         if self.symbol_kinds:
-            if self.symbol_kinds[0].is_pool:
-                # call_kernel prepends the pool tensor to args, so it sits at
-                # args[0].  Kernel tensor arg_indices are 0-based among kernel
-                # tensors only, so add 1 to account for the pool.
-                self._symbolic_args: list[SymbolicArg] | None = (
-                    [SymbolicArg(kind=SymbolicArgKind.kAddress, tensor_id=0)]
-                ) + (
-                    [
+            pool_offset = 1 if self.symbol_kinds[0].is_pool else 0
+            args_template: list = []
+            for sk in self.symbol_kinds:
+                if sk.is_pool:
+                    args_template.append(
+                        SymbolicArg(kind=SymbolicArgKind.kAddress, tensor_id=0)
+                    )
+                elif sk.is_dimension:
+                    args_template.append(None)  # resolved at run() time
+                else:
+                    args_template.append(
                         SymbolicArg(
                             kind=SymbolicArgKind.kAddress,
-                            tensor_id=sk.arg_index + 1,
+                            tensor_id=sk.arg_index + pool_offset,
                         )
-                        for sk in self.symbol_kinds[1:]
-                    ]
-                )
-            else:
-                # No pool param — arg_index maps directly to args position.
-                self._symbolic_args = [
-                    SymbolicArg(kind=SymbolicArgKind.kAddress, tensor_id=sk.arg_index)
-                    for sk in self.symbol_kinds
-                ]
+                    )
+            self._symbolic_args: list | None = args_template
+            self._has_dim_args: bool = any(a is None for a in args_template)
         else:
             self._symbolic_args = None
+            self._has_dim_args = False
 
     @property
     def jobplan(self):
@@ -145,6 +145,30 @@ class SpyreSDSCKernelRunner:
         logger.info("RUN: %s %s", self.kernel_name, self.code_dir)
         with torch.profiler.record_function(f"launch_jobplan:{self.kernel_name}"):
             if self._symbolic_args is not None:
-                launch_jobplan(self.jobplan, args, self._symbolic_args)
+                if self._has_dim_args:
+                    # Resolve dimension symbols from actual tensor shapes.
+                    pool_offset = (
+                        1
+                        if self.symbol_kinds and self.symbol_kinds[0].is_pool
+                        else 0
+                    )
+                    resolved = []
+                    for sk, sa in zip(self.symbol_kinds, self._symbolic_args):
+                        if sa is None:  # is_dimension sentinel
+                            tid = sk.arg_index + pool_offset
+                            actual_size = int(args[tid].shape[sk.dim_index])
+                            resolved.append(
+                                SymbolicArg(
+                                    kind=SymbolicArgKind.kDimension,
+                                    tensor_id=tid,
+                                    dim_index=sk.dim_index,
+                                    value=actual_size,
+                                )
+                            )
+                        else:
+                            resolved.append(sa)
+                    launch_jobplan(self.jobplan, args, resolved)
+                else:
+                    launch_jobplan(self.jobplan, args, self._symbolic_args)
             else:
                 launch_jobplan(self.jobplan, args)

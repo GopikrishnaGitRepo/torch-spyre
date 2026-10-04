@@ -3251,6 +3251,7 @@ def splice_while_loops(graph) -> None:
     from torch_spyre._inductor.pass_utils import compute_max_size
     from torch_spyre._inductor.wsr.coarse_tile import _rebase_point_splice_reads
     from torch_spyre._inductor.wsr.while_loop_bridge import (
+        _storage_name,
         carry_bindings_for,
         splice_while_loop,
     )
@@ -3314,7 +3315,10 @@ def splice_while_loops(graph) -> None:
                 continue
 
             carries = carry_bindings_for(while_op, stacking)
-            names_before_splice = {op.get_name() for op in graph.operations}
+            names_before_splice = {
+                name for op in graph.operations
+                if (name := _storage_name(op)) is not None or (hasattr(op, "get_name") and (name := getattr(op, "get_name", lambda: None)()) is not None)
+            }
             group_ops = splice_while_loop(
                 graph, while_op, carries, trip_count=trip_count
             )
@@ -3322,12 +3326,16 @@ def splice_while_loops(graph) -> None:
             # carry's pre-loop ownership copy. It runs once per trip of every
             # enclosing level, never per trip of this one, so it joins the
             # ancestors' names below but not this level's.
-            group_names = {op.get_name() for op in group_ops}
+            group_names = {
+                name for op in group_ops
+                if (name := _storage_name(op)) is not None or (hasattr(op, "get_name") and (name := getattr(op, "get_name", lambda: None)()) is not None)
+            }
             pre_loop_names = [
-                op.get_name()
+                name
                 for op in graph.operations
-                if op.get_name() not in names_before_splice
-                and op.get_name() not in group_names
+                if (name := _storage_name(op)) is not None or (hasattr(op, "get_name") and (name := getattr(op, "get_name", lambda: None)()) is not None)
+                if name not in names_before_splice
+                and name not in group_names
             ]
 
             _consume_tile_dim_markers(group_ops, graph.operations)
@@ -3376,7 +3384,10 @@ def splice_while_loops(graph) -> None:
     # objects recorded during the splice phase above, which may have gone
     # stale (see this function's own docstring) -- and stamp in level order
     # (group_idx ascending, i.e. outermost first).
-    name_to_op = {op.get_name(): op for op in graph.operations}
+    name_to_op = {
+        name: op for op in graph.operations
+        if (name := _storage_name(op)) is not None or (hasattr(op, "get_name") and (name := getattr(op, "get_name", lambda: None)()) is not None)
+    }
     for loop_var, trip_count, level_group_idx, op_names in pending_levels:
         missing = [name for name in op_names if name not in name_to_op]
         if missing:

@@ -1301,11 +1301,10 @@ def splice_while_loop(
     for i in range(len(carries), len(body_graph_input_names)):
         placeholder_name = body_graph_input_names[i]
         real_input = real_inputs[i]
-        if not hasattr(real_input, "get_name"):
-            continue
-        real_name = real_input.get_name()
-        name_map[placeholder_name] = real_name
         ref_map[placeholder_name] = real_input
+        real_name = _storage_name(real_input)
+        if real_name is not None:
+            name_map[placeholder_name] = real_name
 
     if name_map:
         body_ops = [

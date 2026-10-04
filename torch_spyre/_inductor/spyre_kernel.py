@@ -455,7 +455,12 @@ class SpyreKernelOpsHandler(DefaultHandler):
             sym = sympy_index_symbol(f"indirect{self.kernel._indirect_var_count}")
             self.kernel._indirect_var_count += 1
             self.kernel.indirect_vars[sym] = index_var
-            self.kernel.indirect_sizes[sym] = int(size)
+            size_expr = sympy.sympify(size)
+            if size_expr.free_symbols:
+                upper = finite_upper_or_none(size_expr)
+                self.kernel.indirect_sizes[sym] = upper if upper is not None else size_expr
+            else:
+                self.kernel.indirect_sizes[sym] = int(size_expr)
             return sym
         return sympy_index_symbol(str(index_var))
 

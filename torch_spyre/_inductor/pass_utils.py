@@ -970,7 +970,12 @@ class _IndirectIndexFinder:
                     "chained indirect indexing is not supported"
                 )
             self._pending_indirect_index_buf = index_var.name
-            self._pending_indirect_index_size = int(size)
+            size_expr = sympy.sympify(size)
+            if size_expr.free_symbols:
+                upper = finite_upper_or_none(size_expr)
+                self._pending_indirect_index_size = upper if upper is not None else size_expr
+            else:
+                self._pending_indirect_index_size = int(size_expr)
         return sympy.S.Zero
 
     def __getattr__(self, attr):

@@ -77,6 +77,22 @@ def generate_bundle(
     always produce
     ``!sdscbundle.input_arg<index, granularity=G, max_value=M>`` parameters.
 
+    A ``LoopSpec`` whose ``count`` is symbolic (a ``for_each_tile`` loop
+    sliced on an operand marked dynamic -- e.g. a paged-attention index/
+    table tensor, as opposed to the *value* tensor it reads from) emits the
+    same ``input_arg<index, granularity=G, max_value=M>`` shape, but as a
+    ``%loop_bound_{i}_base`` function parameter instead of a
+    ``%sym_{...}_base`` one: the loop's real trip count is supplied live, at
+    launch, and ``%loop_bound_{i}`` -- the exact SSA name every nested
+    ``scf.for`` already references -- becomes its extracted value directly,
+    rather than a baked ``arith.constant``. This is the one place a symbol
+    is confined to a trip count instead of an address, per the symbolic-
+    shapes design (``docs/symbolic_shapes.md`` Section 3/6): the dimension
+    symbol it produces is still counted in this function's returned
+    ``list[SymbolKind]``, so the existing ``is_dimension`` guard in
+    ``async_compile.py`` applies identically -- compilation only proceeds
+    once the runtime can actually bind a live value into this kind of slot.
+
     Requires ``config.bundle_symbolic_args`` to be True: the SDSC path
     (this function) unconditionally emits symbolic addresses, but
     ``spyre_kernel.py``/``hbm_pool_planning.py`` still bake absolute
@@ -164,8 +180,27 @@ def generate_bundle(
     # -----------------------------------------------------------------------
 
     # Collect loop bounds and affine maps needed across the whole tree.
-    loop_bounds: list[sympy.Expr] = []
+    # Each entry is (count, count_symbol_bounds) -- the latter is
+    # (max_value, granularity) when count is symbolic (a for_each_tile loop
+    # sliced on an operand marked dynamic, e.g. a paged-attention index/table
+    # tensor), None when count is a concrete int.
+    loop_bounds: list[tuple[sympy.Expr, "tuple[int, int] | None"]] = []
     _collect_loop_bounds(specs_list, loop_bounds)
+
+    # One SymbolKind.dimension per symbolic loop bound, keyed by its position
+    # in loop_bounds (same indexing _emit_specs already uses for
+    # %loop_bound_{lb_idx}). Unlike an indirect-access dimension symbol (which
+    # is an argument to some op's own sdsc_execute), a loop-bound symbol is
+    # purely a bundle-level control-flow value -- it is never registered via
+    # compute_op_spec's per-op symbol table, so it is built here directly
+    # instead of being discovered among the already-compiled SDSCs' symbols.
+    loop_dim_symbol_kinds: dict[int, SymbolKind] = {}
+    for lb_idx, (lb, lb_bounds) in enumerate(loop_bounds):
+        if lb_bounds is not None:
+            max_value, granularity = lb_bounds
+            loop_dim_symbol_kinds[lb_idx] = SymbolKind.dimension(
+                granularity, max_value, str(lb)
+            )
 
     # Affine map deduplication: stride_key -> map index (0-based).
     # A stride_key is a tuple of stride values in outermost-first level order.
@@ -276,9 +311,15 @@ def generate_bundle(
         # device_mem_allocate, not as a function parameter.
         emit_pool_param = has_pool and _spyre_config.frontend_pool_allocation
         # Built in lock-step with the params list so the two can never diverge.
-        # Order: pool (when frontend_pool_allocation), kernel addresses, dimensions.
+        # Order: pool (when frontend_pool_allocation), kernel addresses,
+        # indirect-access dimensions, loop-bound dimensions.
         param_symbol_kinds: list[SymbolKind] = []
-        if emit_pool_param or kernel_arg_sym_indices or dimension_sym_indices:
+        if (
+            emit_pool_param
+            or kernel_arg_sym_indices
+            or dimension_sym_indices
+            or loop_dim_symbol_kinds
+        ):
             params = []
             if emit_pool_param:
                 params.append("%pool_base_addr: !sdscbundle.input_arg<index>")
@@ -293,6 +334,11 @@ def generate_bundle(
                     f"{dim_param_names[sym_idx]}_base: {_dim_input_arg_type(dim_sk)}"
                 )
                 param_symbol_kinds.append(symbol_kinds[sym_idx])
+            for lb_idx, loop_dim_sk in loop_dim_symbol_kinds.items():
+                params.append(
+                    f"%loop_bound_{lb_idx}_base: {_dim_input_arg_type(loop_dim_sk)}"
+                )
+                param_symbol_kinds.append(loop_dim_sk)
             f.write(f"\tfunc.func @sdsc_bundle({', '.join(params)}) {{\n")
         else:
             f.write("\tfunc.func @sdsc_bundle() {\n")
@@ -331,8 +377,21 @@ def generate_bundle(
         if loop_bounds:
             f.write("\t\t%c0 = arith.constant 0 : index\n")
             f.write("\t\t%c1 = arith.constant 1 : index\n")
-            for lb_idx, lb in enumerate(loop_bounds):
-                f.write(f"\t\t%loop_bound_{lb_idx} = {_mlir_count_value(lb)}\n")
+            for lb_idx, (lb, _lb_bounds) in enumerate(loop_bounds):
+                if lb_idx in loop_dim_symbol_kinds:
+                    # %loop_bound_{lb_idx} is itself the live, runtime-supplied
+                    # trip count (already divided by tile_size in Python, at
+                    # trace time) -- extracted directly from its input_arg,
+                    # same %loop_bound_{lb_idx} name _emit_specs's scf.for
+                    # already references, so no change is needed there.
+                    loop_dim_sk = loop_dim_symbol_kinds[lb_idx]
+                    f.write(
+                        f"\t\t%loop_bound_{lb_idx} = sdscbundle.input_arg_extract"
+                        f" value from %loop_bound_{lb_idx}_base :"
+                        f" {_dim_input_arg_type(loop_dim_sk)} -> index\n"
+                    )
+                else:
+                    f.write(f"\t\t%loop_bound_{lb_idx} = {_mlir_count_value(lb)}\n")
 
         # Emit one declaration per symbol:
         #   - "kernel"          → skipped; already a function param + extract op above
@@ -582,10 +641,14 @@ def _compile_specs(
 
 
 def _collect_loop_bounds(specs: list, bounds: list) -> None:
-    """Collect loop trip counts depth-first (same order as loop var naming)."""
+    """Collect (count, count_symbol_bounds) pairs depth-first.
+
+    Same traversal order as the loop-var naming in _emit_specs, so
+    loop_bounds[i] always lines up with the i-th nested scf.for.
+    """
     for entry in specs:
         if isinstance(entry, LoopSpec):
-            bounds.append(entry.count)
+            bounds.append((entry.count, entry.count_symbol_bounds))
             _collect_loop_bounds(entry.body, bounds)
 
 

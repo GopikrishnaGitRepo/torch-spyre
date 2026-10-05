@@ -1011,7 +1011,24 @@ class SpyreKernel(Kernel[CSEVariable]):
                     level_syms.append(self._get_or_mint_level_symbol(lvl, op_name))
                 tiled_syms_per_level_outermost.append(level_syms)
                 if lvl < len(loop_count):
-                    trip_count = int(loop_count[lvl])
+                    # A for_each_tile-sliced operand (e.g. a paged-attention
+                    # index/table tensor) marked dynamic makes this level's
+                    # trip count symbolic. tiled_symbol_trip_counts ultimately
+                    # feeds superdsc.py's dev_dim_size = tile_size *
+                    # supertile_count -- the SDSC's own idea of the tensor's
+                    # full physical extent, which per the symbolic-shapes
+                    # design must always be the planning/reservation ceiling
+                    # (mark_dynamic(max=...)), never the live per-call value
+                    # (that value is supplied separately, at launch, via the
+                    # bundle's own symbolic loop-bound input_arg).
+                    count_expr = sympy.sympify(loop_count[lvl])
+                    if count_expr.free_symbols:
+                        upper = finite_upper_or_none(count_expr)
+                        trip_count = (
+                            upper if upper is not None else concretize_expr(count_expr)
+                        )
+                    else:
+                        trip_count = int(count_expr)
                     for sym in level_syms:
                         tiled_symbol_trip_counts[sym] = trip_count
             # Reverse so index 0 = innermost level.
@@ -1382,9 +1399,24 @@ class SpyreKernel(Kernel[CSEVariable]):
             self.op_specs.append(self.create_op_spec(value.op, True, args, op_info))
 
     def wrap_op_specs_in_loop(self, count: sympy.Expr) -> None:
-        """Replace the current op_specs list with a single LoopSpec of the given count."""
+        """Replace the current op_specs list with a single LoopSpec of the given count.
+
+        ``count`` is symbolic when the for_each_tile-sliced operand driving
+        this loop (e.g. a paged-attention index/table tensor) was marked
+        dynamic -- compute_symbolic_bounds resolves its (max, granularity)
+        now, while the ShapeEnv is still live, so bundle.py's codegen phase
+        (which runs after the ShapeEnv is gone) can turn it into a
+        granularity/max_value-typed bundle input_arg instead of crashing on
+        a bare int(count).
+        """
         body = self.op_specs
-        self.op_specs = [LoopSpec(count=count, body=body)]
+        self.op_specs = [
+            LoopSpec(
+                count=count,
+                body=body,
+                count_symbol_bounds=compute_symbolic_bounds(count),
+            )
+        ]
 
     def check_op_specs(self) -> None:
         """Validate and log the finished operation sequence after loop wrapping."""

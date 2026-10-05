@@ -94,6 +94,7 @@ _EXPECTED_TENSOR_WORK_DIVISION_SCHEMA = {
 _EXPECTED_LOOP_SPEC_SCHEMA = {
     "count": "Expr",
     "body": "list[Any]",
+    "count_symbol_bounds": "tuple[int, int] | None",
 }
 
 
@@ -288,6 +289,13 @@ def _canonical_spec(spec: object) -> object:
         return {
             "kind": "loop",
             "count": _canonical_value(spec.count),
+            # Two compiles can share a symbol name (e.g. both "s77") while
+            # mark_dynamic recorded a different min/max/granularity each
+            # time -- that changes the bundle's generated
+            # granularity=.../max_value=... input_arg type, so it must be
+            # part of the fingerprint or a kernel compiled for one bound
+            # could be wrongly cache-hit for another.
+            "count_symbol_bounds": _canonical_value(spec.count_symbol_bounds),
             "body": [_canonical_spec(child) for child in spec.body],
         }
     raise TypeError(f"Unsupported finalized kernel spec: {type(spec).__qualname__}")

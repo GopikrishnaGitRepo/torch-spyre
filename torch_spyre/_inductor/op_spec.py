@@ -412,9 +412,22 @@ class LoopSpec:
     """A counted loop whose body is a sequence of ops, possibly nested.
 
     Attributes:
-        count: Trip count of the loop. May be a symbolic shape expression.
+        count: Trip count of the loop. May be a symbolic shape expression --
+            e.g. the batch dimension of a ``for_each_tile``-sliced operand
+            (an index/table tensor) that was marked dynamic. ``count`` is
+            already the *trip count* (``shape[dim] // tile_size``), not the
+            raw dimension size -- the division happens once, in Python, at
+            trace time, same as the concrete case.
         body: The operations to execute each iteration. Each element may be
             an OpSpec, UnimplementedOp, or a nested LoopSpec.
+        count_symbol_bounds: ``(max_value, granularity)`` for ``count`` when
+            it is symbolic, or ``None`` when ``count`` is a concrete int.
+            Computed once, eagerly, via ``compute_symbolic_bounds`` at the
+            point ``count`` is known (while the ShapeEnv is still live) and
+            carried on the dataclass rather than recomputed later --
+            ``bundle.py``'s codegen phase runs in a reload where the
+            ShapeEnv is gone, mirroring why ``OpSpec.symbolic_dim_bounds``
+            is pre-resolved data rather than a lookup.
 
     Each OpSpec in the body carries its own ``tiled_symbols`` list identifying
     which of its iteration-space symbols are tiled by the loop that directly
@@ -427,6 +440,7 @@ class LoopSpec:
     # list[OpSpec | UnimplementedOp | LoopSpec], typed as Any to accommodate
     # the two distinct UnimplementedOp types (op_spec vs spyre_kernel).
     body: list[Any]
+    count_symbol_bounds: tuple[int, int] | None = None
 
 
 def spyre_constant_tensor(const_val, device, dtype=torch.float16):
@@ -528,7 +542,10 @@ def format_op_spec_list(specs: list, indent: int = 0) -> str:
         item = current_specs[idx]
         prefix = "  " * cur_indent
         if isinstance(item, LoopSpec):
-            lines.append(f"{prefix}LoopSpec(count={item.count})")
+            lines.append(
+                f"{prefix}LoopSpec(count={item.count}, "
+                f"count_symbol_bounds={item.count_symbol_bounds})"
+            )
             lines.append(f"{prefix}  body=[")
             # Push a sentinel to close the body bracket after children.
             stack.append(([_LoopClose(prefix)], cur_indent, 0))

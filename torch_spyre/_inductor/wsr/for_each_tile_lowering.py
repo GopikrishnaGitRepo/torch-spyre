@@ -3197,10 +3197,21 @@ def splice_while_loops(graph) -> None:
         for while_op in while_ops:
             result = try_prove_for_each_tile(while_op)
             if not result.accepted:
+                logger.info(
+                    "SPLICE_WHILE_LOOPS: declined %s: %s",
+                    while_op.get_name(),
+                    result.reason,
+                )
                 continue  # leave untouched; falls through to upstream's default path
 
             loop_var = _body_loop_var(while_op)
             if loop_var is None:
+                logger.info(
+                    "SPLICE_WHILE_LOOPS: declined %s: body_loop_var not found "
+                    "(no DynamicScalar reading the first placeholder with "
+                    "exactly one unbacked symbol def)",
+                    while_op.get_name(),
+                )
                 continue  # body shape doesn't match; leave untouched
 
             # Operations synthesized while splicing this loop (notably a

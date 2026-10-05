@@ -1297,9 +1297,16 @@ def splice_while_loop(
     for i in range(len(carries), len(body_graph_input_names)):
         placeholder_name = body_graph_input_names[i]
         real_input = while_op.inputs[i]
-        real_name = real_input.get_name()
-        name_map[placeholder_name] = real_name
         ref_map[placeholder_name] = real_input
+        # A scalar additional_input (e.g. a symbolic value-tensor batch-dim
+        # size closed over by the loop body) arrives as a
+        # ShapeAsConstantBuffer/NoneAsConstantBuffer -- an IRNode, not a
+        # Buffer, whose inherited get_name() raises. _storage_name returns
+        # None for it instead of crashing the loop scan; such an input has
+        # no buffer name to redirect reads to, so name_map is left unset.
+        real_name = _storage_name(real_input)
+        if real_name is not None:
+            name_map[placeholder_name] = real_name
 
     if name_map:
         body_ops = [

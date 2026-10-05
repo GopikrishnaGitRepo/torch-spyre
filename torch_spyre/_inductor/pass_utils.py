@@ -342,6 +342,20 @@ def finite_upper_or_none(expr: Expr) -> Optional[int]:
     return None
 
 
+def is_unit_dim(r: Union[int, Expr]) -> bool:
+    """Return whether a host dimension extent is statically equal to 1.
+
+    ``int(r) != 1`` is the pervasive raw-to-squeezed dim test throughout
+    coarse_tile.py/spyre_kernel.py/pass_utils.py and raises on a symbolic
+    ``r`` (free_symbols present). A symbolic dim is never a statically-known
+    unit dim -- ``mark_dynamic`` only produces ShapeEnv lower bounds >= 2 --
+    so it must always be treated as non-unit rather than crashing.
+    """
+    if isinstance(r, (int, sympy.Integer)):
+        return int(r) == 1
+    return sympy.sympify(r) == 1
+
+
 def compute_granularity(expr: Expr, max_size: int) -> int:
     """Return the granularity for a symbolic dimension.
 
@@ -1369,7 +1383,7 @@ def broadcast_batch_vars(op: Operation, x_dep: MemoryDep, out_dep: MemoryDep) ->
     raw_to_squeezed: dict[int, int] = {}
     it_idx = 0
     for host_idx, r in enumerate(ranges):
-        if int(r) != 1:
+        if not is_unit_dim(r):
             raw_to_squeezed[host_idx] = it_idx
             it_idx += 1
 

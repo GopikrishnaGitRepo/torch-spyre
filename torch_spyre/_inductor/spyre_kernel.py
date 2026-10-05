@@ -65,6 +65,7 @@ from .pass_utils import (
     concretize_expr,
     compute_symbolic_bounds,
     finite_upper_or_none,
+    is_unit_dim,
     iteration_space,
     iteration_space_with_splits,
     indirect_access_subs_from_kernel,
@@ -454,7 +455,18 @@ class SpyreKernelOpsHandler(DefaultHandler):
             sym = sympy_index_symbol(f"indirect{self.kernel._indirect_var_count}")
             self.kernel._indirect_var_count += 1
             self.kernel.indirect_vars[sym] = index_var
-            self.kernel.indirect_sizes[sym] = int(size)
+            # Symbolic value-tensor batch dim: int(size) raises on a sympy
+            # expr with free_symbols. Read the mark_dynamic(max=N) ShapeEnv
+            # bound instead; fall back to concretize_expr (optimization_hint)
+            # only when no finite bound is recorded (auto-dynamic symbols).
+            size_expr = sympy.sympify(size)
+            if size_expr.free_symbols:
+                upper = finite_upper_or_none(size_expr)
+                self.kernel.indirect_sizes[sym] = (
+                    upper if upper is not None else concretize_expr(size_expr)
+                )
+            else:
+                self.kernel.indirect_sizes[sym] = int(size_expr)
             return sym
         return sympy_index_symbol(str(index_var))
 
@@ -597,7 +609,7 @@ class SpyreKernel(Kernel[CSEVariable]):
         mapped: "int | None" = None
         if hasattr(ir_node, "data") and hasattr(ir_node.data, "ranges"):
             for host_idx, r in enumerate(ir_node.data.ranges):
-                if int(r) != 1:
+                if not is_unit_dim(r):
                     if host_idx == dim:
                         mapped = it_idx
                     it_idx += 1
@@ -615,7 +627,7 @@ class SpyreKernel(Kernel[CSEVariable]):
             if reduction_ranges is not None and reduction_pos >= 0:
                 red_it_idx = 0
                 for host_idx, r in enumerate(reduction_ranges):
-                    if int(r) != 1:
+                    if not is_unit_dim(r):
                         if host_idx == reduction_pos:
                             mapped = n_output_dims + red_it_idx
                             break

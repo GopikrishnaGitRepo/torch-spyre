@@ -59,6 +59,7 @@ from .pass_utils import (
     build_operation_alignment_inputs,
     concretize_expr,
     device_coordinates,
+    finite_upper_or_none,
     indirect_info_from_op,
     iteration_space_from_op,
     iteration_space_with_splits,
@@ -149,7 +150,20 @@ def _scatter_access_subs_and_sizes(
                 for dim_idx, stride in enumerate(coord_layout.stride):
                     if stride == coeff:
                         if 0 <= dim_idx < len(coord_layout.size):
-                            sizes[sym] = coord_layout.size[dim_idx]
+                            dim_sz_expr = sympy.sympify(coord_layout.size[dim_idx])
+                            if dim_sz_expr.free_symbols:
+                                # Symbolic scatter-destination batch dim: read
+                                # the mark_dynamic(max=N) ShapeEnv bound
+                                # rather than silently truncating to a
+                                # heuristic via concretize_expr.
+                                upper = finite_upper_or_none(dim_sz_expr)
+                                sizes[sym] = (
+                                    upper
+                                    if upper is not None
+                                    else concretize_expr(dim_sz_expr)
+                                )
+                            else:
+                                sizes[sym] = int(dim_sz_expr)
                         break
 
     return access_subs, sizes

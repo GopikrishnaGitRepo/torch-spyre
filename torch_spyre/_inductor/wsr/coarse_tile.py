@@ -118,6 +118,14 @@ from .propagate_named_dims import (
     _get_layout,
     _lone_sym,
 )
+
+
+def _is_unit_dim(r: Any) -> bool:
+    """Return True if dimension extent r is statically equal to 1."""
+    if isinstance(r, (int, sympy.Integer)):
+        return int(r) == 1
+    r_expr = sympy.sympify(r)
+    return r_expr == 1 or r_expr == sympy.S.One
 from ..pass_utils import (
     op_out_coords,
     host_coordinates,
@@ -1505,7 +1513,7 @@ def _raw_to_squeezed_pos(ir_node: ComputedBuffer) -> dict[int, int]:
     if ranges is None:
         return pos
     for host_idx, r in enumerate(ranges):
-        if int(r) != 1:
+        if not _is_unit_dim(r):
             pos[host_idx] = it_idx
             it_idx += 1
     # Raw reduction-dim keys are stored offset by the RAW (un-squeezed)
@@ -1520,7 +1528,7 @@ def _raw_to_squeezed_pos(ir_node: ComputedBuffer) -> dict[int, int]:
     reduction_ranges = getattr(ir_node.data, "reduction_ranges", None) or []
     red_it_idx = 0
     for host_idx, r in enumerate(reduction_ranges):
-        if int(r) != 1:
+        if not _is_unit_dim(r):
             pos[raw_n_output_dims + host_idx] = squeezed_n_output_dims + red_it_idx
             red_it_idx += 1
     return pos
@@ -3533,7 +3541,7 @@ def _propagate_mutation_write_back(
     squeeze_pos: dict[int, int] = {}
     it_idx = 0
     for host_idx, r in enumerate(op_ranges):
-        if int(r) != 1:
+        if not _is_unit_dim(r):
             squeeze_pos[host_idx] = it_idx
             it_idx += 1
 
@@ -3858,7 +3866,7 @@ def _propagate_tiled_op(
             squeeze_pos: dict[int, int] = {}
             it_idx = 0
             for host_idx, r in enumerate(op_ranges):
-                if int(r) != 1:
+                if not _is_unit_dim(r):
                     squeeze_pos[host_idx] = it_idx
                     it_idx += 1
             write_level_extents: list[dict[int, Expr]] = [
@@ -4319,7 +4327,7 @@ def _insert_copy_op(
         tiled_op_squeeze_pos: dict[int, int] = {}
         it_idx = 0
         for host_idx, r in enumerate(tiled_op_ranges):
-            if int(r) != 1:
+            if not _is_unit_dim(r):
                 tiled_op_squeeze_pos[host_idx] = it_idx
                 it_idx += 1
         read_level_extents: list[dict[int, Expr]] = [
@@ -4383,7 +4391,7 @@ def _insert_copy_op(
     squeeze_pos: dict[int, int] = {}
     it_idx = 0
     for host_idx, r in enumerate(copy_ranges):
-        if int(r) != 1:
+        if not _is_unit_dim(r):
             squeeze_pos[host_idx] = it_idx
             it_idx += 1
     write_level_extents: list[dict[int, Expr]] = [
@@ -5296,7 +5304,7 @@ def _insert_one_read_copy(
     squeeze_pos: dict[int, int] = {}
     it_idx = 0
     for host_idx, r in enumerate(sizing_op.data.ranges):
-        if int(r) != 1:
+        if not _is_unit_dim(r):
             squeeze_pos[host_idx] = it_idx
             it_idx += 1
     write_level_extents = _fixed_level_extents(sizing_op_info.loop_tiled_dims)
@@ -5460,7 +5468,7 @@ def _insert_one_read_copy(
     red_it_idx = 0
     reduction_ranges = getattr(sizing_op.data, "reduction_ranges", None) or []
     for host_idx, r in enumerate(reduction_ranges):
-        if int(r) != 1:
+        if not _is_unit_dim(r):
             reduction_squeeze_pos[host_idx] = red_it_idx
             red_it_idx += 1
     for d in {d for level in sizing_op_info.loop_tiled_reduction_dims for d in level}:
@@ -7041,7 +7049,7 @@ def _squeezed_retile_dims(
     # A unit consumer axis selects coordinate zero and needs no symbol.  For
     # every axis that does need a symbol, require the complete output shape to
     # match the producer shape before treating raw positions as identities.
-    result = [d for d in grown_dims if int(consumer_ranges[d]) != 1]
+    result = [d for d in grown_dims if not _is_unit_dim(consumer_ranges[d])]
     if result and any(
         sympy.simplify(actual - expected) != 0
         for actual, expected in zip(consumer_ranges, info.new_size)
@@ -7233,7 +7241,7 @@ def _consumer_own_dim_symbol(
     it_idx = 0
     mapped = dim
     for host_idx, r in enumerate(consumer.data.ranges):
-        if int(r) != 1:
+        if not _is_unit_dim(r):
             if host_idx == dim:
                 mapped = it_idx
             it_idx += 1

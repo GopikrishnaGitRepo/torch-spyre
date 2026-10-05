@@ -1296,7 +1296,13 @@ def splice_while_loop(
 
     for i in range(len(carries), len(body_graph_input_names)):
         placeholder_name = body_graph_input_names[i]
-        real_input = while_op.inputs[i]
+        # NOT while_op.inputs[i]: WhileLoop.__init__ splits
+        # [*carried_inputs, *additional_inputs] by _split_by_sym_type, so
+        # self.inputs (tensor_args) silently drops any symbolic/scalar
+        # additional_input (e.g. a symbolic value-tensor batch-dim size) --
+        # shifting or shortening it relative to body_graph_input_names.
+        # additional_inputs is the unfiltered, positionally-aligned list.
+        real_input = while_op.additional_inputs[i - len(carries)]
         ref_map[placeholder_name] = real_input
         # A scalar additional_input (e.g. a symbolic value-tensor batch-dim
         # size closed over by the loop body) arrives as a

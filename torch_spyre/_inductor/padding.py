@@ -253,7 +253,23 @@ def insert_bmm_padding(graph: GraphLowering) -> None:
 
     Deduplication of identical constants across multiple pad calls happens later
     at the IR level via dedup_and_promote_constants.
+
+    NOTE: this pass performs FX-graph surgery (inserting constant_pad_nd nodes
+    before the matmul's FX origin node).  When called on a subgraph lowering
+    (e.g. the body of a ``scan`` / ``for_each_tile`` WhileLoop), the matmul's
+    origin nodes belong to the subgraph's FX graph, but ``lower_pad_sequence``
+    walks ``V.graph`` (the outer GraphLowering's FX graph).  Inserting before a
+    subgraph node in the outer graph crashes with "Node to insert before is not
+    in graph."  Subgraph matmuls are instead padded when ``splice_while_loops``
+    inlines the WhileLoop body into the outer IR (which runs first in
+    CustomPreSchedulingPasses and does its own K-padding at that point).
+    Skip silently here so the body graph's own pre-scheduling pass is a no-op
+    for this step.
     """
+    if hasattr(graph, "parent"):
+        # SubgraphLowering: FX surgery cannot cross subgraph boundaries.
+        return
+
     operations = graph.operations
     for op in list(operations):
         if not isinstance(op, ComputedBuffer):

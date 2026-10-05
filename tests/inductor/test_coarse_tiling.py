@@ -84,6 +84,7 @@ from torch_spyre._inductor.wsr.coarse_tile import (
     _divide_ranges,
     _full_buffer_read_deps,
     _index_var_prefix,
+    _loop_var_to_reduction_ranges_pos,
     _replace_group_op,
     _rescale_index,
     _retile_load_index,
@@ -100,6 +101,7 @@ from torch_spyre._inductor.scratchpad.coarse_tiling import (
     _derive_hint_id_base,
     derive_tiling_groups,
     tile_spec_to_dim_hints,
+    try_resolve_tile_axis_loop_vars,
 )
 from torch_spyre._inductor.scratchpad.plan_solver import (
     CoreDivision,
@@ -2172,6 +2174,11 @@ def _mock_op_out_coords(op):
     return getattr(op, "_test_out_coords", [])
 
 
+def _mock_iteration_space(op):
+    """The loop vars ``_mock_op_out_coords`` names, over the op's own ranges."""
+    return dict(zip(getattr(op, "_test_out_coords", []), op.data.ranges))
+
+
 class TestCoarseTile(unittest.TestCase):
     def setUp(self):
         self._patch = patch(
@@ -2234,6 +2241,21 @@ class TestCoarseTile(unittest.TestCase):
                 _graph([op_known]), [([op_unknown], [(0, Integer(2))])]
             )
 
+    def test_refuses_to_overwrite_existing_loop_info(self):
+        """An op that already carries loop_info -- a for_each_tile loop, say --
+        is not re-tiled: coarse_tile raises rather than replace the record."""
+        gm = fx.symbolic_trace(lambda: None)
+        with V.set_graph_handler(GraphLowering(gm)):
+            tiled_op, _, operations = _make_full_buffer_read_fixture()
+            before = tiled_op.loop_info
+            self.assertIsNotNone(before)
+
+            groups = [([tiled_op], [(0, Integer(8))])]
+            with self.assertRaises(Unsupported) as ctx:
+                coarse_tile_post_stickify(_graph(operations), groups)
+            self.assertIn("would overwrite the existing loop_info", str(ctx.exception))
+            self.assertIs(tiled_op.loop_info, before)
+
     def test_post_stickify_skips_pass_1(self):
         """coarse_tile_post_stickify must skip both planning and execution
         of Pass 1 -- a full-buffer boundary read stays a direct read of the
@@ -2247,6 +2269,9 @@ class TestCoarseTile(unittest.TestCase):
             tiled_op, full_deps, operations = _make_full_buffer_read_fixture()
             self.assertEqual(len(full_deps), 1)
             full_buf_name = full_deps[0].name
+            # The fixture pre-stamps loop_info for the read-copy tests; here
+            # coarse_tile does the stamping, and refuses to overwrite a stamp.
+            tiled_op.loop_info = None
 
             groups = [([tiled_op], [(0, Integer(8))])]
             coarse_tile_post_stickify(_graph(operations), groups)
@@ -2288,8 +2313,10 @@ class TestCoarseTile(unittest.TestCase):
         from collections import namedtuple
 
         from torch_spyre._inductor.scratchpad.utils import (
+            counted_loop_lifetime_overrides,
             counted_loop_lifetime_end_overrides,
         )
+        from torch_spyre._inductor.loop_info import LoopCarryRecord
 
         _dep = namedtuple("_dep", ["name"])
 
@@ -2308,31 +2335,184 @@ class TestCoarseTile(unittest.TestCase):
         _stub_read_writes(body_writer, reads=["arg1"], writes=["internal"])
         reader_x = _make_hinted_op(_make_pointwise([Integer(16)]), "reader_x")
         _stub_read_writes(reader_x, reads=["crossing"], writes=["reader_x_out"])
+        carry_update = _make_hinted_op(_make_pointwise([Integer(16)]), "carry_update")
+        _stub_read_writes(carry_update, reads=["carry"], writes=["carry_update"])
+        carry_update._loop_carry_record = LoopCarryRecord("carry", "carry_update")
         reader_i = _make_hinted_op(_make_pointwise([Integer(16)]), "reader_i")
         _stub_read_writes(reader_i, reads=["internal"], writes=["reader_i_out"])
 
-        operations = [crossing, body_writer, reader_x, reader_i]
+        operations = [crossing, body_writer, reader_x, carry_update, reader_i]
         coarse_tile_post_stickify(
             _graph(operations),
-            [([body_writer, reader_x, reader_i], [(0, Integer(4))])],
+            [([body_writer, reader_x, carry_update, reader_i], [(0, Integer(4))])],
         )
 
-        # The loop body stays ops 1..3: nothing was inserted, the op outside
+        # The loop body stays ops 1..4: nothing was inserted, the op outside
         # the group was not stamped, and the group ops carry the loop id.
-        self.assertEqual(len(operations), 4)
+        self.assertEqual(len(operations), 5)
         self.assertFalse(hasattr(crossing, "loop_info"))
         self.assertEqual(reader_i.loop_info.loop_group_id, (0,))
 
         overrides = counted_loop_lifetime_end_overrides(
-            SimpleNamespace(operations=operations, graph_input_names=["arg0", "arg1"])
+            SimpleNamespace(
+                operations=operations,
+                graph_input_names=["arg0", "arg1", "carry"],
+            )
         )
 
         # Values born before the loop and read inside it -- the computed
         # buffer ``crossing`` and the graph input ``arg1`` -- live through
-        # the loop's textual end (exclusive index 4).  ``internal`` is born
+        # the loop's textual end (exclusive index 5).  ``internal`` is born
         # and consumed inside the loop: no extension.  ``arg0`` is only read
-        # outside the loop: no extension.
-        self.assertEqual(overrides, {"crossing": 4, "arg1": 4})
+        # outside the loop: no extension. Only the compiler-tagged carry starts
+        # at the loop boundary; ordinary crossing values keep their first read.
+        self.assertEqual(overrides, {"crossing": 5, "arg1": 5, "carry": 5})
+        starts, ends = counted_loop_lifetime_overrides(
+            SimpleNamespace(
+                operations=operations,
+                graph_input_names=["arg0", "arg1", "carry"],
+            )
+        )
+        self.assertEqual(starts, {"carry": 1})
+        self.assertEqual(ends, {"crossing": 5, "arg1": 5, "carry": 5})
+
+    def test_counted_loop_protects_start_of_value_read_after_the_loop(self):
+        """A crossing value read after the loop still needs its start widened.
+
+        Its nominal end already covers the loop, so the end override is not
+        required -- but its first in-loop read can fall after the loop's start,
+        leaving a loop-local born earlier disjoint from it under plain liveness.
+        Sharing one LX address then lets the next iteration's write of that local
+        clobber the value before the next iteration reads it. This is why the
+        start bound is decided independently of the end bound, and for every
+        crossing value rather than only a tagged carry.
+        """
+        from types import SimpleNamespace
+
+        from torch_spyre._inductor.scratchpad.plan_solver import LifetimeBoundBuffer
+        from torch_spyre._inductor.scratchpad.utils import (
+            counted_loop_lifetime_overrides,
+        )
+
+        class _Dep:
+            def __init__(self, name):
+                self.name = name
+
+            def __hash__(self):
+                return hash(self.name)
+
+            def __eq__(self, other):
+                return self.name == other.name
+
+        def _op(name, reads, writes, loop=None):
+            rw = SimpleNamespace(
+                reads={_Dep(n) for n in reads}, writes={_Dep(n) for n in writes}
+            )
+            op = SimpleNamespace(name=name)
+            op.get_read_writes = lambda rw=rw: rw
+            op.get_operation_name = lambda n=name: n
+            op.get_name = lambda n=name: n
+            if loop is not None:
+                op.loop_info = SimpleNamespace(loop_group_id=loop)
+            return op
+
+        # Loop is indices 1..4. ``local`` lives [1, 3); ``v`` is first read at 3,
+        # inside the loop, and again at 5, after it -- so its nominal end already
+        # clears the loop end and only the start needs widening.
+        operations = [
+            _op("pre", ["arg0"], ["pre"]),
+            _op("local_w", ["arg1"], ["local"], loop=(0,)),
+            _op("local_r", ["local"], ["r1"], loop=(0,)),
+            _op("v_r", ["v"], ["r2"], loop=(0,)),
+            _op("filler", ["sink"], ["r3"], loop=(0,)),
+            _op("post", ["v"], ["r4"]),
+        ]
+        starts, ends = counted_loop_lifetime_overrides(
+            SimpleNamespace(
+                operations=operations,
+                graph_input_names=["arg0", "arg1", "v", "sink"],
+            )
+        )
+        self.assertEqual(starts.get("v"), 1)
+        self.assertNotIn("v", ends)
+
+        def interval(name, uses):
+            buffer = LifetimeBoundBuffer(
+                name=name,
+                size=64,
+                uses=uses,
+                first_use_is_read=True,
+                in_place_parents=[],
+                lifetime_start_override=starts.get(name),
+                lifetime_end_override=ends.get(name),
+            )
+            return buffer.start_time, buffer.end_time
+
+        v_start, v_end = interval("v", [3, 5])
+        local_start, local_end = interval("local", [1, 2])
+        self.assertEqual((v_start, v_end), (1, 6))
+        self.assertTrue(
+            v_start < local_end and local_start < v_end,
+            "the crossing value must overlap the loop-local it could be aliased with",
+        )
+
+    def test_counted_loop_ignores_hoisted_extern_kernel_loop_info(self):
+        """A loop-body constant hoisted to the graph head is not in the loop.
+
+        ``dedup_and_promote_constants`` moves every ``SpyreConstantFallback`` to
+        the front of ``graph.operations`` but leaves its ``loop_info``. The
+        scheduler only groups SchedulerNodes into counted loops, so the extern
+        kernel runs once before the loop. Counting it as a loop member would
+        start the loop at index 0 and widen the start of every value born before
+        the real loop, breaking in-place handoffs such as ``buf5 -> buf6``.
+        """
+        from types import SimpleNamespace
+
+        from torch._inductor.ir import ExternKernel
+
+        from torch_spyre._inductor.scratchpad.utils import (
+            counted_loop_lifetime_overrides,
+        )
+
+        class _Dep:
+            def __init__(self, name):
+                self.name = name
+
+            def __hash__(self):
+                return hash(self.name)
+
+            def __eq__(self, other):
+                return self.name == other.name
+
+        class _HoistedConstant(ExternKernel):
+            pass
+
+        def _op(name, reads, writes, loop=None, cls=None):
+            rw = SimpleNamespace(
+                reads={_Dep(n) for n in reads}, writes={_Dep(n) for n in writes}
+            )
+            op = SimpleNamespace() if cls is None else cls.__new__(cls)
+            op.get_read_writes = lambda rw=rw: rw
+            if loop is not None:
+                op.loop_info = SimpleNamespace(loop_group_id=loop)
+            return op
+
+        # The loop is really indices 3..4; ``const`` at 0 still carries its
+        # loop-body ``loop_info``. ``child`` is born before the loop, in place
+        # over ``parent``, and is read inside the loop.
+        operations = [
+            _op("const", [], ["const"], loop=(0,), cls=_HoistedConstant),
+            _op("parent", ["arg0"], ["parent"]),
+            _op("child", ["parent"], ["child"]),
+            _op("body", ["child", "const"], ["body"], loop=(0,)),
+            _op("tail", ["body"], ["tail"], loop=(0,)),
+        ]
+        starts, ends = counted_loop_lifetime_overrides(
+            SimpleNamespace(operations=operations, graph_input_names=["arg0"])
+        )
+        self.assertEqual(starts, {})
+        # The constant is born outside the loop and read on every iteration.
+        self.assertEqual(ends, {"child": 5, "const": 5})
 
     def test_end_to_end_shares_one_copy_across_group(self):
         """Full coarse_tile() entry point: two hint-driven ops in one group
@@ -6075,6 +6255,70 @@ class TestReadCopyElisionProof(unittest.TestCase):
         with self.assertRaises(Exception):
             record.copy_name = "other"
 
+    def test_graph_output_copy_is_not_elided(self):
+        from torch._inductor.ir import ComputedBuffer
+
+        from torch_spyre._inductor.loop_info import ReadCopyElisionRecord
+        from torch_spyre._inductor.read_copy_elision import elide_proven_read_copies
+
+        copy_op = MagicMock(spec=ComputedBuffer)
+        copy_op.get_name.return_value = "copy0"
+        consumer = MagicMock(spec=ComputedBuffer)
+        consumer.get_name.return_value = "consumer0"
+        consumer._read_copy_elision_record = ReadCopyElisionRecord(
+            consumer_name="consumer0",
+            copy_name="copy0",
+            source_name="input0",
+            direct_inner_fn=lambda: None,
+        )
+        graph = SimpleNamespace(
+            operations=[copy_op, consumer],
+            get_output_names=lambda: ["copy0"],
+            removed_buffers=set(),
+        )
+
+        with patch(
+            "torch_spyre._inductor.read_copy_elision._prove_matmul_direct_read"
+        ) as prove:
+            elide_proven_read_copies(graph)
+
+        prove.assert_not_called()
+        self.assertEqual(graph.operations, [copy_op, consumer])
+
+    def test_non_memory_dependency_prevents_copy_elision(self):
+        from torch._inductor.dependencies import StarDep
+        from torch._inductor.ir import ComputedBuffer
+
+        from torch_spyre._inductor.loop_info import ReadCopyElisionRecord
+        from torch_spyre._inductor.read_copy_elision import elide_proven_read_copies
+
+        copy_op = MagicMock(spec=ComputedBuffer)
+        copy_op.get_name.return_value = "copy0"
+        consumer = MagicMock(spec=ComputedBuffer)
+        consumer.get_name.return_value = "consumer0"
+        consumer.get_read_writes.return_value.reads = []
+        consumer._read_copy_elision_record = ReadCopyElisionRecord(
+            consumer_name="consumer0",
+            copy_name="copy0",
+            source_name="input0",
+            direct_inner_fn=lambda: None,
+        )
+        star_reader = MagicMock()
+        star_reader.get_read_writes.return_value.reads = [StarDep("copy0")]
+        graph = SimpleNamespace(
+            operations=[copy_op, consumer, star_reader],
+            get_output_names=lambda: [],
+            removed_buffers=set(),
+        )
+
+        with patch(
+            "torch_spyre._inductor.read_copy_elision._prove_matmul_direct_read"
+        ) as prove:
+            elide_proven_read_copies(graph)
+
+        prove.assert_not_called()
+        self.assertEqual(graph.operations, [copy_op, consumer, star_reader])
+
     def test_local_bounds_are_measured_in_source_elements(self):
         from torch._inductor.dependencies import MemoryDep
         from torch_spyre._inductor.read_copy_elision import _affine_bounds
@@ -9303,6 +9547,13 @@ class TestTileSpecLoweringOutput(unittest.TestCase):
                 side_effect=_mock_op_out_coords,
             )
         )
+        self.enterContext(
+            patch(
+                "torch_spyre._inductor.scratchpad.coarse_tiling."
+                "iteration_space_from_op",
+                side_effect=_mock_iteration_space,
+            )
+        )
 
     def _op(self, n_dims, name="op0"):
         op = _make_op(_make_pointwise([Integer(64)] * n_dims), name)
@@ -9343,6 +9594,21 @@ class TestTileSpecLoweringOutput(unittest.TestCase):
         with self.assertRaises(Unsupported):
             tile_spec_to_dim_hints(op, spec, [0])
 
+    def test_output_coord_outside_iteration_space_raises(self):
+        # op_out_coords can surface a symbol the op does not loop over -- an
+        # indirect-index symbol, or an enclosing for_each_tile loop's variable
+        # -- which leaves no loop of the op's own to tile.
+        op = self._op(2)
+        with patch(
+            "torch_spyre._inductor.scratchpad.coarse_tiling.op_out_coords",
+            return_value=[sympy.Symbol("indirect0"), sympy.Symbol("c1")],
+        ):
+            with self.assertRaises(Unsupported):
+                tile_spec_to_dim_hints(op, TileSpec((TileAxis(0, 4),)), [0])
+            # Not vacuous: the other coordinate is an iteration variable.
+            hints = tile_spec_to_dim_hints(op, TileSpec((TileAxis(1, 4),)), [0])
+        self.assertEqual(hints[0].loop_var, sympy.Symbol("c1"))
+
 
 class TestTileSpecLoweringReduction(unittest.TestCase):
     """The reduction-axis lowering is the inverse of reduction_loop_vars."""
@@ -9376,7 +9642,7 @@ class TestTileSpecLoweringReduction(unittest.TestCase):
         # The inverse relationship: the lowered loop_var is exactly the one
         # reduction_loop_vars reports at that position.
         self.assertEqual(h.loop_var, red_vars[0])
-        self.assertEqual(_loop_var_to_reduction_ranges_pos_public(op, h.loop_var), 0)
+        self.assertEqual(_loop_var_to_reduction_ranges_pos(op, h.loop_var), 0)
 
     def test_reduction_host_dim_out_of_bounds_raises(self):
         op = _make_real_reduction_op(
@@ -9401,13 +9667,166 @@ class TestTileSpecLoweringReduction(unittest.TestCase):
         with self.assertRaises(Unsupported):
             tile_spec_to_dim_hints(op, spec, [0])
 
+    def _unit_dim_op(self, name="buf0"):
+        # reduction_ranges [1, 8, 16]: the size-1 dim gets no loop variable.
+        return _make_real_reduction_op(
+            ranges=[Integer(8)],
+            reduction_ranges=[Integer(1), Integer(8), Integer(16)],
+            input_shape_stride=([8, 1, 8, 16], [128, 128, 16, 1]),
+            name=name,
+            hints=((1, 2),),
+        )
 
-def _loop_var_to_reduction_ranges_pos_public(op, sym):
-    from torch_spyre._inductor.wsr.coarse_tile import (
-        _loop_var_to_reduction_ranges_pos,
-    )
+    def test_unit_reduction_index_offset(self):
+        """_loop_var_to_reduction_ranges_pos returns the unsqueezed position when a
+        size-1 reduction dim is squeezed out."""
+        op = self._unit_dim_op()
+        self.assertEqual(
+            [
+                _loop_var_to_reduction_ranges_pos(op, var)
+                for var in reduction_loop_vars(op)
+            ],
+            [1, 2],
+        )
 
-    return _loop_var_to_reduction_ranges_pos(op, sym)
+    def test_unit_reduction_dim_tiles_the_named_dim(self):
+        """``host_dim`` counts the squeezed reduction dims, so on ``[1, 8, 16]``
+        host_dim 0 names the 8 and host_dim 1 the 16. The applier must divide
+        that dim's ``reduction_ranges`` entry, not the entry at the squeezed
+        position."""
+        for host_dim, count, expected in ((0, 2, [1, 4, 16]), (1, 4, [1, 8, 4])):
+            with self.subTest(host_dim=host_dim):
+                op = self._unit_dim_op(f"buf_unit{host_dim}")
+                loop_var = reduction_loop_vars(op)[host_dim]
+                spec = TileSpec((TileAxis(host_dim, count, is_reduction=True),))
+                op.dim_hints = tile_spec_to_dim_hints(op, spec, [1])
+                levels = [(1, Integer(count))]
+                plan = plan_coarse_tile_groups([op], [([op], levels)])
+                _apply_plan([op], (0,), levels, {op.get_operation_name(): 0}, plan)
+                self.assertEqual([int(r) for r in op.data.reduction_ranges], expected)
+                # ... and the loop the hint named is the one that shrank.
+                (read,) = op.get_read_writes().reads
+                self.assertEqual(int(read.ranges[loop_var]), expected[host_dim + 1])
+
+    def test_trailing_broadcast_reduction_dim_tiles_the_named_dim(self):
+        """A reduction dim no read walks (an expanded operand: stride 0) is the
+        last one, so Inductor drops its loop variable from every read dep and
+        ``reduction_loop_vars`` comes back shorter than the non-size-1 dims.
+        What is left is a prefix of them, so the k-th loop variable still
+        belongs to the k-th non-size-1 dim and the hint must tile it, not be
+        dropped."""
+        for reduction_ranges, in_shape_stride, pos, expected in (
+            ([8, 16], ([8, 8, 16], [8, 1, 0]), 0, [4, 16]),
+            ([1, 8, 16], ([8, 1, 8, 16], [8, 8, 1, 0]), 1, [1, 4, 16]),
+        ):
+            with self.subTest(reduction_ranges=reduction_ranges):
+                op = _make_real_reduction_op(
+                    ranges=[Integer(8)],
+                    reduction_ranges=[Integer(r) for r in reduction_ranges],
+                    input_shape_stride=in_shape_stride,
+                    name=f"buf_bcast{len(reduction_ranges)}",
+                    hints=((1, 1),),
+                )
+                # Not vacuous: only the 8 has a loop variable.
+                (loop_var,) = reduction_loop_vars(op)
+                self.assertEqual(_loop_var_to_reduction_ranges_pos(op, loop_var), pos)
+                spec = TileSpec((TileAxis(0, 2, is_reduction=True),))
+                op.dim_hints = tile_spec_to_dim_hints(op, spec, [1])
+                levels = [(1, Integer(2))]
+                plan = plan_coarse_tile_groups([op], [([op], levels)])
+                _apply_plan([op], (0,), levels, {op.get_operation_name(): 0}, plan)
+                self.assertEqual(op.loop_info.loop_tiled_reduction_dims, [[pos]])
+                self.assertEqual([int(r) for r in op.data.reduction_ranges], expected)
+                (read,) = op.get_read_writes().reads
+                self.assertEqual(int(read.ranges[loop_var]), 4)
+
+    def test_loop_vars_that_do_not_pair_raise(self):
+        """Loop variables that do not pair one-to-one with the non-size-1
+        reduction dims (a leaked broadcast symbol, say) leave the applier no
+        position to divide, so lowering refuses them."""
+        op = self._unit_dim_op()
+        leaked = [*reduction_loop_vars(op), sympy_index_symbol("d9")]
+        spec = TileSpec((TileAxis(0, 2, is_reduction=True),))
+        with (
+            patch(
+                "torch_spyre._inductor.wsr.coarse_tile.reduction_loop_vars",
+                return_value=leaked,
+            ),
+            patch(
+                "torch_spyre._inductor.scratchpad.coarse_tiling.reduction_loop_vars",
+                return_value=leaked,
+            ),
+        ):
+            self.assertIsNone(_loop_var_to_reduction_ranges_pos(op, leaked[0]))
+            with self.assertRaises(Unsupported):
+                tile_spec_to_dim_hints(op, spec, [0])
+
+    def test_resolver_reports_what_lowering_raises(self):
+        # Out of bounds: [1, 8, 16] has two reduction loop variables.
+        spec = TileSpec((TileAxis(2, 2, is_reduction=True),))
+        loop_vars, reason = try_resolve_tile_axis_loop_vars(self._unit_dim_op(), spec)
+        self.assertIsNone(loop_vars)
+        with self.assertRaises(Unsupported) as ctx:
+            tile_spec_to_dim_hints(self._unit_dim_op(), spec, [0])
+        self.assertIn(reason, str(ctx.exception))
+
+        op = self._unit_dim_op("buf1")
+        spec = TileSpec((TileAxis(1, 2, is_reduction=True),))
+        self.assertEqual(
+            try_resolve_tile_axis_loop_vars(op, spec),
+            ([reduction_loop_vars(op)[1]], None),
+        )
+
+    def test_no_write_dep_raises(self):
+        # reduction_loop_vars raises StopIteration on an op with no write dep;
+        # lowering reports it as Unsupported rather than letting it escape.
+        op = _make_real_reduction_op(
+            ranges=[Integer(8)],
+            reduction_ranges=[Integer(16)],
+            input_shape_stride=([8, 16], [16, 1]),
+            name="buf0",
+            hints=((1, 0),),
+        )
+        spec = TileSpec((TileAxis(0, 4, is_reduction=True),))
+        with (
+            patch(
+                "torch_spyre._inductor.scratchpad.coarse_tiling.reduction_loop_vars",
+                side_effect=StopIteration,
+            ),
+            self.assertRaises(Unsupported),
+        ):
+            tile_spec_to_dim_hints(op, spec, [0])
+
+    def test_no_indexed_read_dep_raises(self):
+        """``out[i] = sum_r r`` loads no buffer, so ``reduction_loop_vars`` has
+        no read dep to take loop variables from and returns none. The refusal
+        must name that, not the size-1-dim misalignment an empty list also
+        looks like."""
+        from torch._inductor.ir import ComputedBuffer, FixedLayout, Reduction
+        from torch._inductor.virtualized import ops
+
+        node = Reduction.create(
+            device=torch.device("cpu"),
+            dst_dtype=torch.int64,
+            src_dtype=torch.int64,
+            inner_fn=lambda index, rindex: ops.index_expr(rindex[0], torch.int64),
+            ranges=[Integer(8)],
+            reduction_ranges=[Integer(16)],
+            reduction_type="sum",
+        )
+        op = ComputedBuffer(
+            name="buf0",
+            layout=FixedLayout(torch.device("cpu"), torch.int64, [8], [1]),
+            data=node.data.data,  # TensorBox -> StorageBox -> Reduction
+        )
+        op.operation_name = "buf0"
+        self.assertEqual(reduction_loop_vars(op), [])
+        spec = TileSpec((TileAxis(0, 4, is_reduction=True),))
+        loop_vars, reason = try_resolve_tile_axis_loop_vars(op, spec)
+        self.assertIsNone(loop_vars)
+        self.assertIn("read dep", reason)
+        with self.assertRaises(Unsupported):
+            tile_spec_to_dim_hints(op, spec, [0])
 
 
 class TestDeriveTilingGroups(unittest.TestCase):
@@ -9492,6 +9911,13 @@ class TestCoarseTilingPassEquivalence(unittest.TestCase):
                 side_effect=_mock_op_out_coords,
             )
         )
+        self.enterContext(
+            patch(
+                "torch_spyre._inductor.scratchpad.coarse_tiling."
+                "iteration_space_from_op",
+                side_effect=_mock_iteration_space,
+            )
+        )
 
     def _bare(self, ranges, name):
         op = _make_op(_make_pointwise([Integer(r) for r in ranges]), name)
@@ -9571,6 +9997,97 @@ class TestCoarseTilingPassEquivalence(unittest.TestCase):
             self.assertFalse(
                 hasattr(op, "loop_info") and isinstance(op.loop_info, CoarseTileInfo)
             )
+
+
+class TestCoarseTilingPassRegionRefusal(unittest.TestCase):
+    """CoarseTilingPass refuses to tile an op inside a ``for_each_tile`` region.
+
+    A region spans every op between the first and last op one outermost loop
+    stamped (see ``prescribed_regions``), so the refusal covers the ops the loop
+    stamped and any op sitting between them unstamped.  The pass must raise
+    before it touches the graph.
+    """
+
+    _SPEC = TileSpec((TileAxis(0, 4),))
+
+    def setUp(self):
+        self.enterContext(
+            patch(
+                "torch_spyre._inductor.wsr.coarse_tile.op_out_coords",
+                side_effect=_mock_op_out_coords,
+            )
+        )
+        self.enterContext(
+            patch(
+                "torch_spyre._inductor.scratchpad.coarse_tiling.op_out_coords",
+                side_effect=_mock_op_out_coords,
+            )
+        )
+        self.enterContext(
+            patch(
+                "torch_spyre._inductor.scratchpad.coarse_tiling."
+                "iteration_space_from_op",
+                side_effect=_mock_iteration_space,
+            )
+        )
+
+    def _bare(self, name):
+        op = _make_op(_make_pointwise([Integer(256)]), name)
+        op._test_out_coords = [Symbol("c0")]
+        op.dim_hints = []
+        return op
+
+    def _stamped(self, name):
+        """An op stamped the way ``_stamp_direct_loop_info`` stamps a loop body
+        op: ``loop_info`` plus a DimHint carrying the trip count."""
+        op = self._bare(name)
+        op.loop_info = CoarseTileInfo(
+            loop_group_id=(0,), loop_count=[Integer(2)], loop_tiled_dims=[[0]]
+        )
+        op.dim_hints = [
+            DimHint(
+                dim_names=[],
+                split_count=1,
+                loop_var=Symbol("u0"),
+                is_reduction=False,
+                loop_var_range=2,
+            )
+        ]
+        return op
+
+    def _state(self, ops):
+        return [
+            (list(op.dim_hints), getattr(op, "loop_info", None), list(op.data.ranges))
+            for op in ops
+        ]
+
+    def test_refuses_op_the_loop_stamped(self):
+        ops = [self._stamped("op0"), self._stamped("op1")]
+        before = self._state(ops)
+        with self.assertRaisesRegex(
+            Unsupported, "would re-tile op0, which a for_each_tile loop already tiles"
+        ):
+            CoarseTilingPass({"op0": self._SPEC}).apply_pass(_graph(ops))
+        self.assertEqual(self._state(ops), before)
+
+    def test_refuses_unstamped_op_inside_the_loop(self):
+        """op1 has no ``loop_info``; only its position puts it in the loop."""
+        ops = [self._stamped("op0"), self._bare("op1"), self._stamped("op2")]
+        before = self._state(ops)
+        with self.assertRaisesRegex(
+            Unsupported, "would re-tile op1, which a for_each_tile loop already tiles"
+        ):
+            CoarseTilingPass({"op1": self._SPEC}).apply_pass(_graph(ops))
+        self.assertEqual(self._state(ops), before)
+
+    def test_tiles_op_after_the_loop(self):
+        ops = [self._stamped("op0"), self._bare("op1")]
+        loop_before = self._state(ops[:1])
+        CoarseTilingPass({"op1": self._SPEC}).apply_pass(_graph(ops))
+        self.assertIsInstance(ops[1].loop_info, CoarseTileInfo)
+        self.assertEqual(ops[1].loop_info.loop_count, [Integer(4)])
+        self.assertEqual(ops[1].data.ranges[0], Integer(64))
+        self.assertEqual(self._state(ops[:1]), loop_before)
 
 
 if __name__ == "__main__":

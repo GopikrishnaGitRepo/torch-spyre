@@ -252,6 +252,8 @@ inline std::string runtimeCbidName(AIUpti_runtime_api_trace_cbid cbid) {
       return "aiuCommsBenchPairwise";
     case AIUPTI_RUNTIME_TRACE_CBID_BENCH_ALLREDUCE:
       return "aiuCommsBenchAllreduce";
+    case AIUPTI_RUNTIME_TRACE_CBID_SUBMIT_TO_HARDWARE:
+      return "aiuSubmitToHardware";
     default:
       break;
   }
@@ -275,8 +277,9 @@ void AiuptiActivityProfilerSession::handleRuntimeActivity(
   runtime_activity->endTime = activity->end;
   runtime_activity->id = activity->correlation_id;
   runtime_activity->device = activity->process_id;
-  runtime_activity->resource = libkineto::systemThreadId();
-  runtime_activity->threadId = libkineto::threadId();
+  runtime_activity->resource = activity->thread_id;
+  runtime_activity->threadId = activity->thread_id;
+  recordThreadStream(runtime_activity->device, runtime_activity->resource);
   // only enable outgoing flow for launch control block runtime activities
   if (activity->cbid == AIUPTI_RUNTIME_TRACE_CBID_LAUNCH_CB_CMPT) {
     runtime_activity->flow.id = activity->correlation_id;

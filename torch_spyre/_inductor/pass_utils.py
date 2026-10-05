@@ -1003,6 +1003,18 @@ class _IndirectIndexFinder:
     Inductor bakes the index range into the inner_fn closure as the size argument to
     ops.indirect_indexing() — invisible in printed IR, only accessible by re-execution.
     This handler intercepts those calls to recover both the source buffer name and the size.
+
+    When the value tensor's batch dimension is symbolic (e.g. from
+    ``tensor.to("spyre", max=N)`` + ``mark_dynamic``), ``size`` arrives as a
+    sympy expression rather than a plain int.  ``int(size)`` would call
+    ``optimization_hint`` under the hood and return a heuristic integer — the
+    ShapeEnv upper bound from ``mark_dynamic(max=N)`` is then ignored, so work
+    division gets a wrong row-count for the value tensor.
+
+    Instead, ``finite_upper_or_none`` reads the ShapeEnv upper bound directly
+    (the same bound that ``mark_dynamic(max=N)`` records).  If no finite bound
+    exists the fallback is ``concretize_expr`` (same as before), so existing
+    concrete and auto-dynamic shapes are unaffected.
     """
 
     def __init__(self):
@@ -1010,7 +1022,7 @@ class _IndirectIndexFinder:
 
         self._mock = MockHandler()
         self._pending_indirect_index_buf: str | None = None
-        self._pending_indirect_index_size: int | None = None
+        self._pending_indirect_index_size: "int | None" = None
         self.indirect_index_by_buf: dict[str, str] = {}
         self.indirect_index_size_by_buf: dict[str, int] = {}
 
@@ -1039,7 +1051,18 @@ class _IndirectIndexFinder:
                     "chained indirect indexing is not supported"
                 )
             self._pending_indirect_index_buf = index_var.name
-            self._pending_indirect_index_size = int(size)
+            size_expr = sympy.sympify(size)
+            if size_expr.free_symbols:
+                # Symbolic value-tensor batch dim: read the ShapeEnv upper bound
+                # recorded by mark_dynamic(max=N) rather than falling back to
+                # optimization_hint via int(). Falls back to concretize_expr when
+                # no finite ShapeEnv bound exists (auto-dynamic / unbounded symbols).
+                upper = finite_upper_or_none(size_expr)
+                self._pending_indirect_index_size = (
+                    upper if upper is not None else concretize_expr(size_expr)
+                )
+            else:
+                self._pending_indirect_index_size = int(size_expr)
         return sympy.S.Zero
 
     def __getattr__(self, attr):
@@ -1111,8 +1134,17 @@ def indirect_store_sizes(
     markers) to process the row symbol as an ordinary loop var; unlike gather,
     there is no load-side indirect_indexing() call to recover the size from on
     the store side, so we derive it from the layout instead.
+
+    When the scatter destination's batch dimension is symbolic (e.g. from
+    ``tensor.to("spyre", max=N)`` + ``mark_dynamic``), ``layout.size[dim]``
+    arrives as a sympy expression.  ``concretize_expr`` falls back to
+    ``optimization_hint`` and ignores the ShapeEnv upper bound recorded by
+    ``mark_dynamic(max=N)``.  Instead, ``finite_upper_or_none`` reads that
+    bound directly — the same path used by the gather side after the fix to
+    ``_IndirectIndexFinder.indirect_indexing``.  Falls back to
+    ``concretize_expr`` when no finite bound exists so concrete and
+    auto-dynamic shapes are unaffected.
     """
-    host_size = [concretize_expr(s) for s in layout.size]
     host_stride = [concretize_expr(s) for s in layout.stride]
     sizes: dict[sympy.Symbol, int] = {}
     index = dep.index
@@ -1122,7 +1154,14 @@ def indirect_store_sizes(
         coeff = index.coeff(sym)
         for dim, st in enumerate(host_stride):
             if st == coeff:
-                sizes[sym] = host_size[dim]
+                dim_sz_expr = sympy.sympify(layout.size[dim])
+                if dim_sz_expr.free_symbols:
+                    upper = finite_upper_or_none(dim_sz_expr)
+                    sizes[sym] = (
+                        upper if upper is not None else concretize_expr(dim_sz_expr)
+                    )
+                else:
+                    sizes[sym] = int(dim_sz_expr)
                 break
     return sizes
 

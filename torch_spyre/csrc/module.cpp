@@ -379,6 +379,22 @@ PYBIND11_MODULE(_C, m) {
         "stored on the tensor for the runtime resize_ guard to check. "
         "Backs tensor.to(\"spyre\", dynamic={dim: {min, max, "
         "granularity}}).");
+  // Ceiling-only overload: no floor (min=0) and no step (granularity=1), so
+  // any resize_ of `dim` up to `max_size` is legal. Backs tensor.to("spyre",
+  // max=...), the runtime-only shorthand for dynamic= that does not mark the
+  // dim dynamic for Dynamo.
+  m.def(
+      "spyre_empty_reserved",
+      [](c10::IntArrayRef size, c10::IntArrayRef stride, c10::ScalarType dtype,
+         int64_t dim, int64_t max_size) {
+        return spyre::spyre_empty_reserved(size, stride, dtype, dim,
+                                           /*min_size=*/0, max_size,
+                                           /*granularity=*/1);
+      },
+      py::arg("size"), py::arg("stride"), py::arg("dtype"), py::arg("dim"),
+      py::arg("max_size"),
+      "Ceiling-only reservation: same as the 7-argument form with min_size=0 "
+      "and granularity=1. Backs tensor.to(\"spyre\", max=...).");
   m.def("empty_with_layout", &spyre::py_empty_with_layout);
   m.def("as_strided_with_layout", &spyre::as_strided_with_layout);
   m.def("reinterpret_tensor", &spyre::reinterpret_tensor);

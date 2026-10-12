@@ -466,6 +466,20 @@ def set_downcast_warning(arg0: bool) -> None:
     """
 
 def set_spyre_tensor_layout(arg0: torch.Tensor, arg1: SpyreTensorLayout) -> None: ...
+@typing.overload
+def spyre_empty_reserved(
+    size: tuple[int, ...],
+    stride: tuple[int, ...],
+    dtype: torch.dtype,
+    dim: int,
+    max_size: int,
+) -> torch.Tensor:
+    """
+    Ceiling-only reservation: the 7-argument form with min_size=0 and
+    granularity=1. Backs tensor.to("spyre", max=...).
+    """
+
+@typing.overload
 def spyre_empty_reserved(
     size: tuple[int, ...],
     stride: tuple[int, ...],

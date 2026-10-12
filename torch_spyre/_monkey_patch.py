@@ -159,10 +159,13 @@ def _parse_dynamic_spec(dynamic, size) -> _DynamicSpec:
     return _DynamicSpec(dim=dim, min=dim_min, max=dim_max, granularity=granularity)
 
 
-def _require_cpu_to_spyre(self, args, kwargs) -> None:
+def _require_cpu_to_spyre(
+    self, args, kwargs, keyword="dynamic", usage=_DYNAMIC_USAGE_HINT
+) -> None:
     """Raise unless this call is an eager CPU -> "spyre" transfer.
 
-    dynamic= only makes sense for the initial host-to-device copy.
+    dynamic= (and its max= shorthand) only makes sense for the initial
+    host-to-device copy.
     """
     import torch
 
@@ -170,8 +173,7 @@ def _require_cpu_to_spyre(self, args, kwargs) -> None:
     if device is None and len(args) > 0 and isinstance(args[0], (str, torch.device)):
         device = args[0]
     message = (
-        'dynamic= is only supported for CPU -> "spyre" transfers, e.g. '
-        f"{_DYNAMIC_USAGE_HINT}"
+        f'{keyword}= is only supported for CPU -> "spyre" transfers, e.g. {usage}'
     )
     if device is None or torch.device(device).type != DEVICE_NAME:
         raise ValueError(message)
@@ -179,8 +181,31 @@ def _require_cpu_to_spyre(self, args, kwargs) -> None:
         raise ValueError(message)
 
 
-def _transfer_reserved(src, spec: _DynamicSpec) -> "torch.Tensor":
-    """Allocate at the ceiling, copy the real data in, mark the dim dynamic."""
+def _parse_max_spec(max_size, size) -> _DynamicSpec:
+    """Turn a max= shorthand into the equivalent ceiling-only reservation.
+
+    tensor.to("spyre", max=616) reserves dim 0 at 616 with no floor (min=0)
+    and no step (granularity=1): any later resize_ of dim 0 up to 616 is
+    legal. Unlike dynamic=, it declares nothing to the compiler -- no
+    bucket cap or reservation floor applies, and the dim is not marked
+    dynamic -- so it is the runtime half of dynamic= on its own. The
+    remaining bound checks (max >= current size, rank >= 2 so dim 0 is not
+    the stick dim) are enforced by spyre_empty_reserved itself.
+    """
+    if isinstance(max_size, bool) or not isinstance(max_size, int):
+        raise ValueError(f"max={max_size!r} must be an int")
+    if len(size) == 0:
+        raise ValueError("max= needs a tensor with at least one dim to reserve")
+    return _DynamicSpec(dim=0, min=0, max=max_size, granularity=1)
+
+
+def _transfer_reserved(
+    src, spec: _DynamicSpec, mark_dynamic: bool = True
+) -> "torch.Tensor":
+    """Allocate at the ceiling, copy the real data in, mark the dim dynamic.
+
+    ``mark_dynamic=False`` is the max= shorthand: reserve and copy only.
+    """
     import torch
 
     # This path calls spyre_empty_reserved directly via pybind11, bypassing
@@ -218,7 +243,8 @@ def _transfer_reserved(src, spec: _DynamicSpec) -> "torch.Tensor":
     # non-multiple size, raising ConstraintViolationError instead of a
     # normal guard miss. The range is still declared -- just via
     # torch._check inside the traced function, not here.
-    torch._dynamo.mark_dynamic(dst, spec.dim)
+    if mark_dynamic:
+        torch._dynamo.mark_dynamic(dst, spec.dim)
     return dst
 
 
@@ -325,10 +351,22 @@ def _patch_tensor_for_spyre():
         else:
             return None
 
-    def spyre_to(self, *args, device_layout=None, dynamic=None, **kwargs):
+    def spyre_to(self, *args, device_layout=None, dynamic=None, max=None, **kwargs):
+        if dynamic is not None and max is not None:
+            raise ValueError(
+                "pass either dynamic= or its max= shorthand, not both; "
+                f"dynamic= carries max itself, e.g. {_DYNAMIC_USAGE_HINT}"
+            )
         if dynamic is not None:
             _require_cpu_to_spyre(self, args, kwargs)
             return _transfer_reserved(self, _parse_dynamic_spec(dynamic, self.size()))
+        if max is not None:
+            _require_cpu_to_spyre(
+                self, args, kwargs, keyword="max", usage='x.to("spyre", max=512)'
+            )
+            return _transfer_reserved(
+                self, _parse_max_spec(max, self.size()), mark_dynamic=False
+            )
         if device_layout is None:
             # During Dynamo tracing this wrapper is an allow_in_graph leaf: keep
             # the operation device-local so Inductor sees and lowers the dtype

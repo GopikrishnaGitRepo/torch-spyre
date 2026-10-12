@@ -29,7 +29,11 @@ from .ir import FixedTiledLayout, SpyreEmptyFallback
 from .loop_info import ReadCopyElisionRecord
 from .optimize_restickify import AnyInNode, EdgeCostMap
 from .logging_utils import get_inductor_logger
-from .pass_utils import patch_env
+from .pass_utils import (
+    _invalidate_body_caches,
+    finite_upper_or_none,
+    patch_env,
+)
 from torch._inductor.dependencies import MemoryDep, index_vars_squeeze
 from torch._inductor.graph import GraphLowering
 from torch._inductor.ir import (
@@ -287,6 +291,77 @@ def _create_restickify_node(
     return arg_name, restick_buff
 
 
+def _pin_fixed_copy_extent_to_declared_max(restick_buff: ComputedBuffer) -> None:
+    """Size a loop-invariant whole-operand restickify at the declared maximum.
+
+    A restickify that makes a FIXED full copy inside a loop (its source is not a
+    tiled stage, so neither its read nor its write advances per trip) copies the
+    whole operand on every trip. When that operand has a symbolic extent, e.g. a
+    gathered page pool reserved with ``.to("spyre", dynamic=...)``, the copy
+    would carry the symbol into the loop body, where every extent must be
+    static: the body is one compiled tile, and the symbol may live only in a
+    loop trip count.
+
+    So the symbolic extent is replaced by its declared maximum. That is valid at
+    every runtime size because the source buffer is reserved at that maximum:
+    the copy reads rows past the logical extent, which exist in the reservation,
+    and its consumer (a gather) only ever indexes rows below the real size.
+
+    Mutated in place because ``restick_buff`` was created by this pass a moment
+    ago and nothing else holds its derived caches yet; the caches it did build
+    while being lowered are dropped.
+
+    Raises:
+        Unsupported: an extent is symbolic with no declared finite maximum.
+    """
+    ranges = list(restick_buff.data.ranges)
+    syms = set()
+    for r in ranges:
+        syms |= set(getattr(r, "free_symbols", ()) or ())
+    if not syms:
+        return
+    subs: dict = {}
+    for sym in syms:
+        upper = finite_upper_or_none(sym)
+        if upper is None:
+            raise Unsupported(
+                f"restickify {restick_buff.get_name()} makes a fixed copy of an "
+                f"operand with extent {ranges} inside a loop, and {sym} has no "
+                f"declared finite maximum to size it at. Declare the range in the "
+                f"traced region, e.g. torch._check(n <= max)"
+            )
+        subs[sym] = sympy.Integer(upper)
+
+    def pinned(exprs):
+        return [sympy.sympify(e).xreplace(subs) for e in exprs]
+
+    object.__setattr__(restick_buff.data, "ranges", pinned(ranges))
+    _invalidate_body_caches(restick_buff.data)
+    layout = restick_buff.layout
+    if isinstance(layout, FixedTiledLayout):
+        pinned_layout = FixedTiledLayout(
+            layout.device,
+            layout.dtype,
+            pinned(layout.size),
+            pinned(layout.stride),
+            layout.device_layout,
+            offset=layout.offset,
+        )
+        pinned_layout.allocation = layout.allocation
+        restick_buff.layout = pinned_layout
+    ComputedBuffer.get_default_sizes_body.clear_cache(restick_buff)
+    clear = getattr(ComputedBuffer.get_free_symbol_uses, "clear_cache", None)
+    if clear is not None:
+        clear(restick_buff)
+    logger.info(
+        "[symbolic-gather] fixed in-loop copy %s sized at the declared maximum: "
+        "%s -> %s",
+        restick_buff.get_name(),
+        ranges,
+        list(restick_buff.data.ranges),
+    )
+
+
 def insert_restickify_on_node_inputs(
     op: ComputedBuffer,
     resticks_needed: list[RestickifyArgInfo],
@@ -451,6 +526,7 @@ def insert_restickify_on_node_inputs(
             restick_li.squeezed_advance_per_read = []
             restick_li.output_tiled_dims = [[] for _ in range(n_levels)]
             restick_buff.loop_info = restick_li
+            _pin_fixed_copy_extent_to_declared_max(restick_buff)
 
         # A saved direct-read form can sit on an identity whose committed
         # layout is incompatible with its consumer.  The deferred restickify

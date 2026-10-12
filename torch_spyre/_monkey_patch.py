@@ -172,9 +172,7 @@ def _require_cpu_to_spyre(
     device = kwargs.get("device", None)
     if device is None and len(args) > 0 and isinstance(args[0], (str, torch.device)):
         device = args[0]
-    message = (
-        f'{keyword}= is only supported for CPU -> "spyre" transfers, e.g. {usage}'
-    )
+    message = f'{keyword}= is only supported for CPU -> "spyre" transfers, e.g. {usage}'
     if device is None or torch.device(device).type != DEVICE_NAME:
         raise ValueError(message)
     if self.device.type != "cpu":

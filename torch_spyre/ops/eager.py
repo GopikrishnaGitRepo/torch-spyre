@@ -92,6 +92,61 @@ def _guard_reentry(op):
         active.discard(op)
 
 
+# Tensor attributes through which a user's dynamism declaration reaches dynamo
+# (torch._dynamo.mark_dynamic / maybe_mark_dynamic / mark_unbacked).
+_DYNAMO_DYNAMIC_MARKS = (
+    "_dynamo_dynamic_indices",
+    "_dynamo_weak_dynamic_indices",
+    "_dynamo_unbacked_indices",
+    "_dynamo_strict_unbacked_indices",
+)
+
+
+def _strip_dynamo_marks(args, kwargs):
+    """Hand a static per-op compile mark-free aliases of marked tensors.
+
+    A ``dynamic=False`` standalone kernel is one binary per concrete shape. A
+    dim the user marked dynamic -- e.g. by ``tensor.to("spyre", dynamic=...)``,
+    which marks it for the user's OWN compiled region -- still reaches dynamo
+    as a symbol, because ``mark_dynamic`` overrides ``dynamic=False``. That
+    either raises ConstraintViolationError (a d2d ``copy_`` ties the dim to a
+    concrete size) or, worse, compiles a symbolic kernel whose geometry is baked
+    at the first call's size and is then silently wrong for larger ones (#3826).
+
+    ``detach()`` gives a fresh Python object over the same storage and
+    SpyreTensorImpl metadata, without the marks. Returns the new args/kwargs and
+    ``{id(alias): original}`` for ``_remap_result``.
+    """
+    originals = {}
+
+    def strip(x):
+        if isinstance(x, torch.Tensor):
+            if any(hasattr(x, mark) for mark in _DYNAMO_DYNAMIC_MARKS):
+                alias = x.detach()
+                originals[id(alias)] = x
+                return alias
+            return x
+        if isinstance(x, (list, tuple)):
+            return type(x)(strip(e) for e in x)
+        return x
+
+    args = tuple(strip(a) for a in args)
+    kwargs = {k: strip(v) for k, v in kwargs.items()}
+    return args, kwargs, originals
+
+
+def _static_shape_call(compiled):
+    """Wrap a ``dynamic=False`` compiled kernel so user dynamism marks never reach it."""
+
+    @functools.wraps(compiled)
+    def call(*args, **kwargs):
+        args, kwargs, originals = _strip_dynamo_marks(args, kwargs)
+        result = compiled(*args, **kwargs)
+        return _remap_result(result, originals) if originals else result
+
+    return call
+
+
 # Decorator to keep track of compiled variant
 def compile_once(op, **compile_kwargs):
     def decorator(fn):
@@ -105,6 +160,8 @@ def compile_once(op, **compile_kwargs):
                 if isinstance(op, str):
                     op = operator.attrgetter(op)(torch.ops)
                 compiled = torch.compile(_op_frame(op), **compile_kwargs)
+                if compile_kwargs.get("dynamic") is False:
+                    compiled = _static_shape_call(compiled)
             with _guard_reentry(op):
                 return fn(*args, compiled=compiled, **kwargs)
 

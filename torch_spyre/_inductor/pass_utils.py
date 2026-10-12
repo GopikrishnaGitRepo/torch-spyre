@@ -528,6 +528,45 @@ def max_trip_count(count) -> int:
     return upper
 
 
+def indirect_index_range(size) -> int:
+    """The valid range of an indirect index, as a plain int.
+
+    ``ops.indirect_indexing(index, size)`` carries the extent of the indexed
+    (source) dimension. For a gathered pool whose own length is symbolic, e.g. a
+    page pool reserved with ``.to("spyre", dynamic=...)``, that size is the
+    pool's symbol. It is a TABLE LENGTH, not a loop extent: it only bounds the
+    index values and never becomes a trip count, so it needs no bundle
+    parameter.
+
+    It resolves to the DECLARED MAXIMUM, never this call's hint. Every downstream
+    consumer uses the range to build static geometry and bounds, and the pool
+    buffer is reserved at the maximum, so every index valid at any runtime size
+    is inside it. Sizing it from the warm-up call would make a larger pool's
+    upper pages unaddressable while the binary claims to serve the whole range.
+
+    Raises:
+        Unsupported: the size is symbolic with no finite upper bound, so no
+            static range exists. Declare the range in the traced region.
+    """
+    if not (hasattr(size, "free_symbols") and size.free_symbols):
+        return int(size)
+    upper = finite_upper_or_none(size)
+    if upper is None:
+        raise Unsupported(
+            f"indirect index range {size} is symbolic with no finite upper bound, "
+            f"so the gather's source extent cannot be described statically. "
+            f"Declare the range for {sorted(map(str, size.free_symbols))} in the "
+            f"traced region, e.g. torch._check(n <= max)"
+        )
+    logger.info(
+        "[symbolic-gather] indirect index range %s resolved to its declared "
+        "maximum %d (the source pool is reserved at that maximum)",
+        size,
+        upper,
+    )
+    return upper
+
+
 def compute_granularity(expr: Expr, max_size: int) -> int:
     """Return the granularity for a symbolic dimension. SDSC route only.
 
@@ -1230,7 +1269,7 @@ class _IndirectIndexFinder:
                     "chained indirect indexing is not supported"
                 )
             self._pending_indirect_index_buf = index_var.name
-            self._pending_indirect_index_size = int(size)
+            self._pending_indirect_index_size = indirect_index_range(size)
         return sympy.S.Zero
 
     def __getattr__(self, attr):

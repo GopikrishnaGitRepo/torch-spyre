@@ -670,18 +670,23 @@ PYBIND11_MODULE(_C, m) {
         const auto resolved =
             spyre::JobPlanStepHostCompute::resolveSymbolicArgs(tensors,
                                                                symbolic_args);
-        std::vector<uintptr_t> addrs;
-        addrs.reserve(resolved.size());
+        py::list out;
         for (const auto& host_arg : resolved) {
-          addrs.push_back(reinterpret_cast<uintptr_t>(
-              std::get<const flex::CompositeAddress*>(host_arg)));
+          if (const auto* addr =
+                  std::get_if<const flex::CompositeAddress*>(&host_arg)) {
+            out.append(reinterpret_cast<uintptr_t>(*addr));
+          } else {
+            out.append(std::get<int64_t>(host_arg));
+          }
         }
-        return addrs;
+        return out;
       },
       py::arg("tensors"), py::arg("symbolic_args"),
-      "Test-only: resolve a symbolic_args payload to a list of device-address "
-      "integers (CompositeAddress* cast to uintptr_t). Same tensor yields the "
-      "same integer; different tensor yields a different integer.");
+      "Test-only: resolve a symbolic_args payload to a list of integers. A "
+      "kAddress slot yields its CompositeAddress* cast to uintptr_t (same "
+      "tensor yields the same integer; different tensor yields a different "
+      "integer); a kDimension slot yields the tensor's logical size along "
+      "dim_index.");
 
   // ── Two-stream overlap: step-ordering validator + test hooks ──
 

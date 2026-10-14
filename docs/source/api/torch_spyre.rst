@@ -681,6 +681,12 @@ Environment Variables
    * - ``TORCH_SPYRE_NUM_HOST_COMPUTE_STREAMS``
      - Size of the host-compute stream pool used by program correction
        (default ``4``, maximum ``8``)
+   * - ``SPYRE_HAZARD_TRACKER``
+     - Split the program-correction triple across the ``S_prep`` and
+       ``S_dev`` streams and let flex insert the cross-stream H2D-to-compute
+       edge, overlapping the two stages. Off by default, which keeps the
+       single-stream FIFO ordering. On values match flex's grammar exactly:
+       ``1``, ``true``, ``t``, ``yes``, ``y``
    * - ``SPYRE_INDUCTOR_LOG=1``
      - *Deprecated*. Use ``TORCH_LOGS='torch_spyre.inductor'``. Enables Spyre
        Inductor logging (INFO level)
@@ -722,8 +728,9 @@ Environment Variables
    * - ``CO_OPTIMIZING_LX_PLANNING``
      - Use the co-optimizing LX allocator strategy (default ``1``)
    * - ``CPSAT_TIME_LIMIT_SECONDS``
-     - Wall-clock budget for one CP-SAT solve (default ``30``; ``0``
-       disables the limit)
+     - Wall-clock budget for one CP-SAT solve (default ``60``; ``0``
+       disables the limit). Applies separately to each optimization phase.
+       A timeout may return a feasible plan without proving optimality.
    * - ``HBM_POOL_PLANNING``
      - Enable HBM-pool planning for intermediates not in LX
        (default ``1``)
@@ -732,6 +739,13 @@ Environment Variables
        passed in as ``%pool_base_addr``, instead of the backend
        self-allocating via ``sdscbundle.device_mem_allocate``
        (default ``0``)
+   * - ``SPYRE_BACKEND_LOOP_UNROLL``
+     - Enable SDSC-bundle backend loop unrolling (default ``1``). Set ``0``
+       to preserve counted device loops; this requires autopilot. Set before
+       importing torch-spyre. Accepts case-insensitive ``1``/``true``/``yes``
+       and ``0``/``false``/``no``; invalid values raise an error. The resolved
+       boolean is part of the kernel cache key. See
+       :doc:`/compiler/working_set_reduction` for Python configuration.
    * - ``SPYRE_CORE_ID_K_FAST_EMISSION``
      - Permute physical core IDs at SDSC emission so K-collaborator cores
        sit on adjacent ring positions, reducing PSUM chain hops (default
@@ -739,10 +753,6 @@ Environment Variables
    * - ``BUNDLE_SYMBOLIC_ARGS``
      - Emit LPDDR5 tensor addresses as runtime symbols rather than baked
        integers (default ``1``)
-   * - ``TORCHINDUCTOR_COMPILE_THREADS``
-     - Number of Inductor compile workers. Independent backend kernels compile in
-       parallel when this is greater than ``1``; a value of ``1`` executes
-       compilation inline
    * - ``LAYOUT_SOLVER``
      - LX scratchpad layout solver strategy: ``cpsat`` (default),
        ``greedy``, ``bestfit``, ``firstfit``, ``simulated_annealing``.
@@ -873,6 +883,10 @@ Environment Variables
    * - ``FLEX_DEVICE``
      - Select the underlying flex runtime mode (``PF``, ``VF``, or
        ``MOCK``)
+   * - ``LOCAL_RANK``
+     - Per-process rank set by torchrun. Seeds the logical Spyre device
+       index when ``set_device()`` has not been called (0 when unset;
+       invalid or out-of-range values raise)
 
 **Internal:**
 
@@ -897,3 +911,7 @@ Environment Variables
      - Verbose PyTorch Inductor logging
    * - ``TORCH_COMPILE_DEBUG=1``
      - Dump Inductor debug artifacts
+   * - ``TORCHINDUCTOR_COMPILE_THREADS``
+     - Number of Inductor compile workers. Independent backend kernels
+       compile in parallel when this is greater than ``1``; a value of
+       ``1`` executes compilation inline

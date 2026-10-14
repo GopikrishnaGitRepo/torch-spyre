@@ -130,6 +130,48 @@ void JobPlanStepCompute::write(std::ostream& os) const {
      << "\n";
 }
 
+std::vector<flex::HostComputeArg> JobPlanStepHostCompute::resolveSymbolicArgs(
+    const std::vector<at::Tensor>& tensors,
+    const std::vector<SymbolicArg>& symbolic_args) {
+  std::vector<flex::HostComputeArg> resolved(symbolic_args.size());
+  for (size_t i = 0; i < symbolic_args.size(); ++i) {
+    const SymbolicArg& arg = symbolic_args[i];
+    TORCH_CHECK(arg.tensor_id >= 0 &&
+                    static_cast<size_t>(arg.tensor_id) < tensors.size(),
+                "symbolic_args tensor_id out of range");
+    switch (arg.kind) {
+      case SymbolicArgKind::kAddress:
+        resolved[i] = get_composite_address(tensors[arg.tensor_id]);
+        break;
+      case SymbolicArgKind::kDimension: {
+        // A varying dimension behind a symbolic loop bound. The bundle
+        // declares it as
+        //   !sdscbundle.input_arg<index, granularity=G, max_value=M>
+        // and the device derives the trip count from it as (ub - lb) / step,
+        // so the value bound here is the ONLY place the runtime size enters
+        // the program. Nothing in the program body is rewritten for it, which
+        // is the whole point: an address or stride derived from this size
+        // would instead have to be recomputed on every dispatch.
+        //
+        // size(), i.e. the LOGICAL size. Under a max-strided reservation the
+        // allocation is deliberately larger, and it is the logical size that
+        // varies per call and that the trip count must track.
+        const at::Tensor& tensor = tensors[arg.tensor_id];
+        TORCH_CHECK(arg.dim_index >= 0 && arg.dim_index < tensor.dim(),
+                    "symbolic_args[", i, "] dim_index ", arg.dim_index,
+                    " is out of range for the rank-", tensor.dim(),
+                    " tensor at tensor_id ", arg.tensor_id);
+        resolved[i] = static_cast<int64_t>(tensor.size(arg.dim_index));
+        break;
+      }
+      default:
+        TORCH_CHECK(false, "Unknown SymbolicArgKind value: ",
+                    static_cast<int32_t>(arg.kind));
+    }
+  }
+  return resolved;
+}
+
 void JobPlanStepHostCompute::construct(LaunchContext& ctx,
                                        const SpyreStream& stream) const {
   std::vector<flex::HostComputeArg> args;
@@ -138,43 +180,8 @@ void JobPlanStepHostCompute::construct(LaunchContext& ctx,
   // the distinction into HostComputeParams directly.
   if (input_buffer_ == nullptr && !(ishape_.size() == 1 && ishape_[0] == 0)) {
     if (!ctx.symbolic_args.empty()) {
-      // Case 3a: typed symbolic args: one HostComputeArg per slot.
-      for (const auto& sym : ctx.symbolic_args) {
-        TORCH_CHECK(sym.tensor_id >= 0 && static_cast<size_t>(sym.tensor_id) <
-                                              ctx.inputs_outputs.size(),
-                    "symbolic_args tensor_id out of range");
-        switch (sym.kind) {
-          case SymbolicArgKind::kAddress:
-            args.push_back(
-                get_composite_address(ctx.inputs_outputs[sym.tensor_id]));
-            break;
-          case SymbolicArgKind::kDimension: {
-            // A varying dimension behind a symbolic loop bound. The bundle
-            // declares it as
-            //   !sdscbundle.input_arg<index, granularity=G, max_value=M>
-            // and the device derives the trip count from it as
-            // (ub - lb) / step, so the value bound here is the ONLY place the
-            // runtime size enters the program. Nothing in the program body is
-            // rewritten for it, which is the whole point: an address or stride
-            // derived from this size would instead have to be recomputed on
-            // every dispatch.
-            //
-            // size(), i.e. the LOGICAL size. Under a max-strided reservation
-            // the allocation is deliberately larger, and it is the logical
-            // size that varies per call and that the trip count must track.
-            const at::Tensor& tensor = ctx.inputs_outputs[sym.tensor_id];
-            TORCH_CHECK(sym.dim_index >= 0 && sym.dim_index < tensor.dim(),
-                        "symbolic_args dim_index ", sym.dim_index,
-                        " is out of range for the rank-", tensor.dim(),
-                        " tensor at inputs_outputs[", sym.tensor_id, "]");
-            args.push_back(static_cast<int64_t>(tensor.size(sym.dim_index)));
-            break;
-          }
-          default:
-            TORCH_CHECK(false, "unhandled SymbolicArgKind ",
-                        static_cast<int32_t>(sym.kind));
-        }
-      }
+      // Case 3a: typed symbolic args — delegate to resolveSymbolicArgs.
+      args = resolveSymbolicArgs(ctx.inputs_outputs, ctx.symbolic_args);
     } else {
       // Case 3b: legacy: one Address arg per context tensor in order.
       for (const auto& tensor : ctx.inputs_outputs) {

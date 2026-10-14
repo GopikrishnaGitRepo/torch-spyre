@@ -844,6 +844,18 @@ def test_a_batch_artifact_writes_what_insert_artifact_wrote():
     assert new.tables == old.tables
 
 
+def test_a_batch_image_named_by_tag_records_its_digest_and_keeps_its_id():
+    fields = {"component": "torch-spyre", "artifact_name": "torch-spyre-dev", "id12": "9e" * 6,
+              "arch": "amd64", "ref": f"{IMAGE}:amd64-dev-{'9e' * 6}"}  # fmt: skip
+    client = FakeClient()
+    batch = {"artifacts": [{"artifact": {**fields, "content_digest": LEAF}}]}
+    assert artifacts.write_batch(client, "db", batch)["artifacts"] == 1
+    (art,) = client.tables[ARTIFACTS.name]
+    (ref,) = client.tables[ARTIFACT_REFS.name]
+    assert (ref["ref"], ref["content_digest"]) == (fields["ref"], LEAF)
+    assert art["artifact_id"] == artifacts.batch_identity(fields).artifact_id
+
+
 def test_a_batch_spec_entry_is_resolved_then_recorded():
     batch = {
         "artifacts": [
@@ -1107,8 +1119,8 @@ def test_a_delivery_stream_records_its_list_and_leaves_under_the_stream_tag():
         for t in client.tables[ARTIFACT_TAGS.name]
     ) == sorted(
         [
-            (stream, "ci-cd-tech-preview", lst["artifact_id"]),
-            (stream, "ci-cd-tech-preview", leaf["artifact_id"]),
+            ("ci-cd-tech-preview-v1", "ci-cd-tech-preview", lst["artifact_id"]),
+            ("ci-cd-tech-preview-v1", "ci-cd-tech-preview", leaf["artifact_id"]),
         ]
     )
 
@@ -1166,3 +1178,27 @@ def test_a_leaf_named_with_the_wrong_arch_is_refused():
         with pytest.raises(ValueError, match="recorded as"):
             resolve(f"image:{IMAGE}@{LEAF}", "s390x", registry=registry,
                     lookup=FakeLookup(arches={LEAF: {"ppc64le"}}))  # fmt: skip
+
+
+def test_both_tech_preview_spellings_are_one_tag_row():
+    stream = "cicd-tech-preview-v4"
+    reg = FakeRegistry({**LISTED, stream: (LIST, LISTED[LIST][1])}, [stream])
+    assert family_of(stream) == "ci-cd-tech-preview"
+    client = FakeClient()
+    # The registry's spelling found by family, the other spelling given in full, and the canonical one.
+    for kw in (
+        {"tag_family": "ci-cd-tech-preview"},
+        {"tags": [stream]},
+        {"tags": ["ci-cd-tech-preview-v4"]},
+        {"tag_family": "ci-cd-tech-preview", "tags": [stream]},
+    ):
+        out = ensure(client, "db", f"image:{IMAGE}@{LIST}", "multi", registry=reg, **kw)
+        assert (out["tag"], out["tag_family"]) == (
+            "ci-cd-tech-preview-v4",
+            "ci-cd-tech-preview",
+        )
+    (row,) = client.tables[ARTIFACT_TAGS.name]
+    assert (row["tag"], row["props"]["registry_tag"]) == (
+        "ci-cd-tech-preview-v4",
+        stream,
+    )

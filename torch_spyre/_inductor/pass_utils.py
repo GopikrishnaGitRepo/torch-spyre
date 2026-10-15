@@ -544,27 +544,53 @@ def indirect_index_range(size) -> int:
     is inside it. Sizing it from the warm-up call would make a larger pool's
     upper pages unaddressable while the binary claims to serve the whole range.
 
+    Resolving to the maximum also makes an out-of-range index unobservable: an
+    index at or above the current size but below the maximum reads a stale row
+    of the reservation, and nothing downstream can tell it from a valid one. A
+    device-side bounds check would need the source's LOGICAL size at launch.
+    No launch slot carries it today (the only ``kDimension`` slot of a gather
+    loop is its trip count, the index count), so such a check needs a new slot
+    for the source extent, not a change here.
+
     Raises:
         Unsupported: the size is symbolic with no finite upper bound, so no
-            static range exists. Declare the range in the traced region.
+            static range exists.
     """
     if not (hasattr(size, "free_symbols") and size.free_symbols):
         return int(size)
     upper = finite_upper_or_none(size)
     if upper is None:
         raise Unsupported(
-            f"indirect index range {size} is symbolic with no finite upper bound, "
-            f"so the gather's source extent cannot be described statically. "
-            f"Declare the range for {sorted(map(str, size.free_symbols))} in the "
-            f"traced region, e.g. torch._check(n <= max)"
+            undeclared_maximum_message(f"indirect index range {size}", size)
         )
-    logger.info(
+    logger.debug(
         "[symbolic-gather] indirect index range %s resolved to its declared "
         "maximum %d (the source pool is reserved at that maximum)",
         size,
         upper,
     )
     return upper
+
+
+def undeclared_maximum_message(subject: str, expr) -> str:
+    """Refusal text for a symbolic extent that has no declared maximum.
+
+    Shared by every site that must size a symbolic extent statically at its
+    declared maximum, so the advice is the same wherever the refusal fires.
+    The range has to be declared twice for now: ``.to("spyre", dynamic=...)``
+    reserves the buffer at the maximum, and an in-trace ``torch._check`` is
+    what the compiler reads, until the declaration is carried into the trace.
+    The two maxima must agree: the reservation is what makes the compiler's
+    maximum addressable.
+    """
+    syms = sorted(map(str, getattr(expr, "free_symbols", ()) or ()))
+    return (
+        f"{subject} is symbolic with no declared maximum for {syms}, so it "
+        "cannot be sized statically. Declare the dimension's range on the "
+        'tensor, e.g. x.to("spyre", dynamic={0: dict(min=8, max=16, '
+        "granularity=8)}), and state the same maximum in the compiled "
+        "function, e.g. torch._check(x.shape[0] <= 16)"
+    )
 
 
 def compute_granularity(expr: Expr, max_size: int) -> int:

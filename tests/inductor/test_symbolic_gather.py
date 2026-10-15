@@ -37,6 +37,7 @@ import tempfile
 import unittest
 from contextlib import contextmanager
 from functools import wraps
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import regex as re
@@ -47,7 +48,7 @@ from torch._inductor.utils import run_and_get_code
 
 import torch_spyre  # noqa: F401  registers the "spyre" device
 from torch_spyre._C import SymbolicArgKind, _resolve_symbolic_args
-from torch_spyre._inductor import pass_utils
+from torch_spyre._inductor import insert_restickify, pass_utils
 from torch_spyre._inductor.errors import Unsupported
 from torch_spyre._inductor.wsr.for_each_tile import for_each_tile
 from torch_spyre.constants import DEVICE_NAME
@@ -60,7 +61,17 @@ BLOCKS_MIN, BLOCKS_MAX, BLOCKS_G = 8, 16, 1  # index tensor, dim 0 (G == tile_si
 POOL_SPEC = {0: {"min": POOL_MIN, "max": POOL_MAX, "granularity": POOL_G}}
 BLOCKS_SPEC = {0: {"min": BLOCKS_MIN, "max": BLOCKS_MAX, "granularity": BLOCKS_G}}
 
-REL_TOL = 2e-2
+# Max-normalised relative error (rel_err below), set at about 2x the worst
+# observed on device over BOTH_SIZES. Reduction mode chains two fp16 matmuls and
+# accumulates over up to 16 blocks: observed 3.4e-3 .. 5.1e-3. Map mode is a
+# gathered copy times 2.0, so only the fp16 <-> device-format rounding remains:
+# observed 4.5e-4 .. 9.3e-4.
+REL_TOL = 1e-2
+MAP_REL_TOL = 2e-3
+
+# Shared by both refusals (pass_utils.undeclared_maximum_message): names the
+# missing maximum and the supported way to declare it.
+UNDECLARED_MAX_REFUSAL = r'no declared maximum.*\.to\("spyre", dynamic='
 
 
 def _check_blocks(block_table):
@@ -452,7 +463,9 @@ class TestGatherMapMode(_ResetEachTest):
                 table.to(DEVICE_NAME, dynamic=BLOCKS_SPEC),
             )
             self.assertEqual(tuple(out.shape), (nb, PAGE_SIZE, PAGE_HS))
-            self.assertLess(rel_err(out, ref_gather_pages_map(pages, table)), REL_TOL)
+            self.assertLess(
+                rel_err(out, ref_gather_pages_map(pages, table)), MAP_REL_TOL
+            )
         self.assertEqual(c.compiles, 1)
 
 
@@ -471,6 +484,34 @@ class TestGatherIndexDtype(_ResetEachTest):
         self.assertEqual(c.compiles, 1)
 
 
+class TestGatherKnownLimits(_ResetEachTest):
+    def test_index_past_current_pool_reads_stale_rows(self):
+        """KNOWN LIMITATION, pinned so a change to it is noticed (indirect access
+        track, https://github.com/torch-spyre/torch-spyre/issues/4382).
+
+        The index range is the pool's declared maximum, so a page id at or
+        above the CURRENT pool size but below the maximum is not refused: the
+        gather reads whatever the reservation still holds there. Here the pool
+        is filled at 16 pages and shrunk to 8 without a refill, so ids 8..15
+        return the old pages. If a bounds check is added this test must fail
+        and be replaced by one that expects the refusal.
+        """
+        c = _Counted(paged_gather)
+        q = _q()
+        pool_buf = torch.zeros(POOL_MAX, PAGE_SIZE, PAGE_HS, dtype=torch.float16).to(
+            DEVICE_NAME, dynamic=POOL_SPEC
+        )
+        old_pages = _pages(POOL_MAX, 3)
+        pool_buf.copy_(old_pages)
+        pool_buf.resize_(POOL_MIN, PAGE_SIZE, PAGE_HS)
+        table = torch.randint(POOL_MIN, POOL_MAX, (BLOCKS_MIN, 32), dtype=torch.int32)
+        out = c.fn(
+            pool_buf, table.to(DEVICE_NAME, dynamic=BLOCKS_SPEC), q.to(DEVICE_NAME)
+        )
+        self.assertLess(rel_err(out, ref_paged_gather(old_pages, table, q)), REL_TOL)
+        self.assertEqual(c.compiles, 1)
+
+
 class TestGatherRefusals(_ResetEachTest):
     def test_undeclared_pool_range_is_refused_not_guessed(self):
         """A symbolic pool with no declared maximum has no static range, so the
@@ -479,7 +520,7 @@ class TestGatherRefusals(_ResetEachTest):
         c = _Counted(paged_gather_no_pool_range)
         q = _q()
         pages, table = _pages(8, 0), _table(8, 8, 0)
-        with self.assertRaisesRegex(Exception, "no finite upper bound"):
+        with self.assertRaisesRegex(Exception, UNDECLARED_MAX_REFUSAL):
             c.fn(
                 pages.to(DEVICE_NAME, dynamic=POOL_SPEC),
                 table.to(DEVICE_NAME, dynamic=BLOCKS_SPEC),
@@ -510,6 +551,32 @@ class TestIndirectIndexRange(unittest.TestCase):
         with patch.object(pass_utils, "finite_upper_or_none", return_value=None):
             with self.assertRaisesRegex(Unsupported, "s7"):
                 pass_utils.indirect_index_range(s)
+            with self.assertRaisesRegex(Unsupported, UNDECLARED_MAX_REFUSAL):
+                pass_utils.indirect_index_range(s)
+
+
+class TestPinFixedCopyExtent(unittest.TestCase):
+    def test_symbolic_extent_without_maximum_is_refused(self):
+        """The fixed in-loop copy refuses an extent it cannot size, with the
+        same advice as the index-range refusal."""
+        s = sympy.Symbol("s9", integer=True, positive=True)
+        restick_buff = SimpleNamespace(
+            data=SimpleNamespace(ranges=[s, PAGE_SIZE, PAGE_HS]),
+            get_name=lambda: "buf_restick",
+        )
+        with patch.object(insert_restickify, "finite_upper_or_none", return_value=None):
+            with self.assertRaisesRegex(Unsupported, UNDECLARED_MAX_REFUSAL):
+                insert_restickify._pin_fixed_copy_extent_to_declared_max(restick_buff)
+            with self.assertRaisesRegex(Unsupported, r"buf_restick.*s9"):
+                insert_restickify._pin_fixed_copy_extent_to_declared_max(restick_buff)
+
+    def test_static_extent_is_left_alone(self):
+        restick_buff = SimpleNamespace(
+            data=SimpleNamespace(ranges=[sympy.Integer(16), PAGE_SIZE, PAGE_HS]),
+            get_name=lambda: "buf_restick",
+        )
+        insert_restickify._pin_fixed_copy_extent_to_declared_max(restick_buff)
+        self.assertEqual(list(restick_buff.data.ranges), [16, PAGE_SIZE, PAGE_HS])
 
 
 if __name__ == "__main__":

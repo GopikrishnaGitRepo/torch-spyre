@@ -30,9 +30,10 @@ from .loop_info import ReadCopyElisionRecord
 from .optimize_restickify import AnyInNode, EdgeCostMap
 from .logging_utils import get_inductor_logger
 from .pass_utils import (
-    _invalidate_body_caches,
     finite_upper_or_none,
+    invalidate_op_read_writes,
     patch_env,
+    undeclared_maximum_message,
 )
 from torch._inductor.dependencies import MemoryDep, index_vars_squeeze
 from torch._inductor.graph import GraphLowering
@@ -308,12 +309,32 @@ def _pin_fixed_copy_extent_to_declared_max(restick_buff: ComputedBuffer) -> None
     and its consumer (a gather) only ever indexes rows below the real size.
 
     Mutated in place because ``restick_buff`` was created by this pass a moment
-    ago and nothing else holds its derived caches yet; the caches it did build
-    while being lowered are dropped.
+    ago and nothing else holds a reference to it yet. Changing ``ranges``
+    changes the iteration space itself, so every cache derived from it is
+    dropped. The list is the one ``coarse_tile`` clears after its own
+    ``ranges`` rewrite (``_divide_ranges``), the other place that rewrites a
+    ``Loops``' ranges in place: the ``Loops`` free symbols, ``inner_fn`` string
+    and op count, the ``ComputedBuffer`` sizes/body and free symbols, and the
+    memoized read/writes. The layout is rebuilt rather than mutated, so it
+    carries no stale cache. A stale entry would surface as a wrong extent in
+    the emitted copy; ``test_bundle_and_kernel_structure`` in
+    ``tests/inductor/test_symbolic_gather.py`` asserts the copy's
+    ``device_size`` at the maximum.
 
     Raises:
         Unsupported: an extent is symbolic with no declared finite maximum.
     """
+    # Deferred import: coarse_tile and this module avoid importing each other
+    # at load time (see coarse_tile._NameSwapHandler).
+    from .wsr.coarse_tile import (
+        _COMPUTED_BUF_FREE_SYMS_KEY,
+        _COMPUTED_BUF_SIZES_KEY,
+        _LOOPS_FREE_SYMS_KEY,
+        _LOOPS_INNER_FN_OPCOUNT_KEY,
+        _LOOPS_INNER_FN_STR_KEY,
+        _clear_cache,
+    )
+
     ranges = list(restick_buff.data.ranges)
     syms = set()
     for r in ranges:
@@ -325,10 +346,11 @@ def _pin_fixed_copy_extent_to_declared_max(restick_buff: ComputedBuffer) -> None
         upper = finite_upper_or_none(sym)
         if upper is None:
             raise Unsupported(
-                f"restickify {restick_buff.get_name()} makes a fixed copy of an "
-                f"operand with extent {ranges} inside a loop, and {sym} has no "
-                f"declared finite maximum to size it at. Declare the range in the "
-                f"traced region, e.g. torch._check(n <= max)"
+                undeclared_maximum_message(
+                    f"restickify {restick_buff.get_name()}, a fixed copy inside a "
+                    f"loop with extent {ranges},",
+                    sym,
+                )
             )
         subs[sym] = sympy.Integer(upper)
 
@@ -336,7 +358,12 @@ def _pin_fixed_copy_extent_to_declared_max(restick_buff: ComputedBuffer) -> None
         return [sympy.sympify(e).xreplace(subs) for e in exprs]
 
     object.__setattr__(restick_buff.data, "ranges", pinned(ranges))
-    _invalidate_body_caches(restick_buff.data)
+    _clear_cache(restick_buff.data, _LOOPS_FREE_SYMS_KEY)
+    _clear_cache(restick_buff.data, _LOOPS_INNER_FN_STR_KEY)
+    _clear_cache(restick_buff.data, _LOOPS_INNER_FN_OPCOUNT_KEY)
+    _clear_cache(restick_buff, _COMPUTED_BUF_SIZES_KEY)
+    _clear_cache(restick_buff, _COMPUTED_BUF_FREE_SYMS_KEY)
+    invalidate_op_read_writes(restick_buff)
     layout = restick_buff.layout
     if isinstance(layout, FixedTiledLayout):
         pinned_layout = FixedTiledLayout(
@@ -349,10 +376,6 @@ def _pin_fixed_copy_extent_to_declared_max(restick_buff: ComputedBuffer) -> None
         )
         pinned_layout.allocation = layout.allocation
         restick_buff.layout = pinned_layout
-    ComputedBuffer.get_default_sizes_body.clear_cache(restick_buff)
-    clear = getattr(ComputedBuffer.get_free_symbol_uses, "clear_cache", None)
-    if clear is not None:
-        clear(restick_buff)
     logger.info(
         "[symbolic-gather] fixed in-loop copy %s sized at the declared maximum: "
         "%s -> %s",
@@ -526,6 +549,9 @@ def insert_restickify_on_node_inputs(
             restick_li.squeezed_advance_per_read = []
             restick_li.output_tiled_dims = [[] for _ in range(n_levels)]
             restick_buff.loop_info = restick_li
+            # Only this branch needs the pin: a tiled-stage copy above advances
+            # per trip and takes its extent from the tile, while this fixed copy
+            # takes the whole operand's, which may be symbolic (a reserved pool).
             _pin_fixed_copy_extent_to_declared_max(restick_buff)
 
         # A saved direct-read form can sit on an identity whose committed

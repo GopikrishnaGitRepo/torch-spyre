@@ -311,15 +311,25 @@ def _pin_fixed_copy_extent_to_declared_max(restick_buff: ComputedBuffer) -> None
     Mutated in place because ``restick_buff`` was created by this pass a moment
     ago and nothing else holds a reference to it yet. Changing ``ranges``
     changes the iteration space itself, so every cache derived from it is
-    dropped. The list is the one ``coarse_tile`` clears after its own
-    ``ranges`` rewrite (``_divide_ranges``), the other place that rewrites a
-    ``Loops``' ranges in place: the ``Loops`` free symbols, ``inner_fn`` string
-    and op count, the ``ComputedBuffer`` sizes/body and free symbols, and the
-    memoized read/writes. The layout is rebuilt rather than mutated, so it
-    carries no stale cache. A stale entry would surface as a wrong extent in
-    the emitted copy; ``test_bundle_and_kernel_structure`` in
-    ``tests/inductor/test_symbolic_gather.py`` asserts the copy's
-    ``device_size`` at the maximum.
+    dropped, and the list below is complete, not just sufficient. The derived
+    state lives in three places:
+
+    - the ``@cache_on_self`` methods of the two mutated objects. On the
+      ``Pointwise`` data those are ``get_free_symbol_uses``, ``inner_fn_str``
+      and ``inner_fn_opcount`` (all from ``Loops``); on the ``ComputedBuffer``
+      they are ``get_free_symbol_uses`` and ``get_default_sizes_body``. That is
+      every cached method either class has, all five are cleared, and
+      ``TestPinFixedCopyExtent.test_clears_every_cached_method`` in
+      ``tests/inductor/test_symbolic_gather.py`` derives the set from the IR
+      classes, so a cached method added upstream fails it instead of going
+      stale here;
+    - the memoized read/writes (``invalidate_op_read_writes``);
+    - the layout, which is rebuilt rather than mutated and so carries no cache.
+
+    This is the same list ``coarse_tile`` clears after its own ``ranges``
+    rewrite (``_divide_ranges``), the other place that rewrites a ``Loops``'
+    ranges in place. A stale entry would surface as a wrong extent in the
+    emitted copy rather than as an error.
 
     Raises:
         Unsupported: an extent is symbolic with no declared finite maximum.

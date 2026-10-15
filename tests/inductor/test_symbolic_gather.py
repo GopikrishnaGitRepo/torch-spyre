@@ -43,6 +43,7 @@ from unittest.mock import patch
 import regex as re
 import sympy
 import torch
+from torch._inductor import ir
 from torch._inductor.compile_fx import compile_fx
 from torch._inductor.utils import run_and_get_code
 
@@ -50,6 +51,7 @@ import torch_spyre  # noqa: F401  registers the "spyre" device
 from torch_spyre._C import SymbolicArgKind, _resolve_symbolic_args
 from torch_spyre._inductor import insert_restickify, pass_utils
 from torch_spyre._inductor.errors import Unsupported
+from torch_spyre._inductor.wsr import coarse_tile
 from torch_spyre._inductor.wsr.for_each_tile import for_each_tile
 from torch_spyre.constants import DEVICE_NAME
 from torch_spyre.execution import kernel_runner
@@ -577,6 +579,46 @@ class TestPinFixedCopyExtent(unittest.TestCase):
         )
         insert_restickify._pin_fixed_copy_extent_to_declared_max(restick_buff)
         self.assertEqual(list(restick_buff.data.ranges), [16, PAGE_SIZE, PAGE_HS])
+
+    def test_clears_every_cached_method(self):
+        """The pin rewrites ``ranges``, so it must drop every cached method of
+        the restickify's Pointwise data and ComputedBuffer. The expected set is
+        derived from the IR classes, not copied from the pin, so a cached method
+        added upstream fails here instead of surviving as a stale extent."""
+
+        def cache_keys(cls):
+            return {
+                coarse_tile._cache_key(getattr(cls, name))
+                for name in dir(cls)
+                if hasattr(getattr(cls, name, None), "clear_cache")
+            }
+
+        s = sympy.Symbol("s9", integer=True, positive=True)
+        restick_buff = SimpleNamespace(
+            data=SimpleNamespace(ranges=[s, PAGE_SIZE, PAGE_HS]),
+            layout=None,
+            get_name=lambda: "buf_restick",
+        )
+        cleared = []
+        with (
+            patch.object(insert_restickify, "finite_upper_or_none", return_value=16),
+            patch.object(
+                coarse_tile,
+                "_clear_cache",
+                side_effect=lambda obj, key: cleared.append((obj, key)),
+            ),
+        ):
+            insert_restickify._pin_fixed_copy_extent_to_declared_max(restick_buff)
+
+        self.assertEqual(list(restick_buff.data.ranges), [16, PAGE_SIZE, PAGE_HS])
+        self.assertEqual(
+            {key for obj, key in cleared if obj is restick_buff.data},
+            cache_keys(ir.Pointwise),
+        )
+        self.assertEqual(
+            {key for obj, key in cleared if obj is restick_buff},
+            cache_keys(ir.ComputedBuffer),
+        )
 
 
 if __name__ == "__main__":

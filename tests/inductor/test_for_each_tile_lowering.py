@@ -2816,7 +2816,9 @@ class TestTryProveForEachTile(unittest.TestCase):
                 enable_spyre_lowerings(),
             ):
                 graph.run(counter)
-                self.assertEqual(_extract_trip_count(graph), 16)
+                result = _extract_trip_count(graph)
+                self.assertTrue(result.accepted, result.reason)
+                self.assertEqual(result.trip_count, 16)
                 self.assertEqual(len(graph.operations), 1)
                 self.assertIsInstance(graph.operations[0], ir.ComputedBuffer)
 

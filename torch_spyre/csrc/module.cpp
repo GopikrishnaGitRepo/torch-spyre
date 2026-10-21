@@ -34,7 +34,9 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <type_traits>
 #include <utility>
+#include <variant>
 #include <vector>
 
 #include "job_plan.h"
@@ -406,6 +408,31 @@ PYBIND11_MODULE(_C, m) {
   m.def("spyre_empty_with_layout", &spyre::spyre_empty_with_layout,
         py::arg("size"), py::arg("stride"), py::arg("dtype"),
         py::arg("device_layout"), py::arg("device") = py::none());
+  m.def("spyre_empty_reserved", &spyre::spyre_empty_reserved, py::arg("size"),
+        py::arg("stride"), py::arg("dtype"), py::arg("dim"),
+        py::arg("min_size"), py::arg("max_size"), py::arg("granularity"),
+        "Allocate a Spyre tensor whose physical layout/storage are sized "
+        "for dim `dim` == `max_size`, while its logical (PyTorch-visible) "
+        "size/stride stay at `size`/`stride`. `min_size`/`granularity` are "
+        "stored on the tensor for the runtime resize_ guard to check. "
+        "Backs tensor.to(\"spyre\", dynamic={dim: {min, max, "
+        "granularity}}).");
+  // Ceiling-only overload: no floor (min=0) and no step (granularity=1), so
+  // any resize_ of `dim` up to `max_size` is legal. Backs tensor.to("spyre",
+  // max=...), the runtime-only shorthand for dynamic= that does not mark the
+  // dim dynamic for Dynamo.
+  m.def(
+      "spyre_empty_reserved",
+      [](c10::IntArrayRef size, c10::IntArrayRef stride, c10::ScalarType dtype,
+         int64_t dim, int64_t max_size) {
+        return spyre::spyre_empty_reserved(size, stride, dtype, dim,
+                                           /*min_size=*/0, max_size,
+                                           /*granularity=*/1);
+      },
+      py::arg("size"), py::arg("stride"), py::arg("dtype"), py::arg("dim"),
+      py::arg("max_size"),
+      "Ceiling-only reservation: same as the 7-argument form with min_size=0 "
+      "and granularity=1. Backs tensor.to(\"spyre\", max=...).");
   m.def("empty_with_layout", &spyre::py_empty_with_layout);
   m.def("as_strided_with_layout", &spyre::as_strided_with_layout);
   m.def("reinterpret_tensor", &spyre::reinterpret_tensor);
@@ -449,6 +476,31 @@ PYBIND11_MODULE(_C, m) {
   m.def("set_spyre_tensor_layout", &spyre::set_spyre_tensor_layout);
   m.def("get_spyre_tensor_sizes", &spyre::get_spyre_tensor_sizes);
   m.def("get_spyre_tensor_strides", &spyre::get_spyre_tensor_strides);
+  m.def(
+      "get_reserved_dims",
+      [](const at::Tensor& tensor)
+          -> std::optional<std::map<int64_t, std::map<std::string, int64_t>>> {
+        // The dict-of-strings conversion lives here, at the Python
+        // boundary, rather than in spyre::get_reserved_dims itself -- a
+        // C++ caller of that function gets the typed ReservedDimInfo
+        // struct with compile-time field checking, not string lookups
+        // into a dict it has to spell correctly.
+        auto reserved = spyre::get_reserved_dims(tensor);
+        if (!reserved.has_value()) {
+          return std::nullopt;
+        }
+        std::map<int64_t, std::map<std::string, int64_t>> result;
+        for (const auto& [dim, info] : *reserved) {
+          result[dim] = {{"min", info.min},
+                         {"max", info.max},
+                         {"granularity", info.granularity}};
+        }
+        return result;
+      },
+      py::arg("tensor"),
+      "Return {dim: {'min', 'max', 'granularity'}} for a tensor.to("
+      "\"spyre\", dynamic=...) reservation, or None. Never raises, even "
+      "for a non-Spyre tensor.");
   m.def("get_downcast_warning", &spyre::get_downcast_warn_enabled,
         "Return whether downcast warnings are enabled.");
   m.def("set_downcast_warning", &spyre::set_downcast_warn_enabled,
@@ -694,11 +746,12 @@ PYBIND11_MODULE(_C, m) {
       "        preserves today's legacy behavior.");
 
   // Test-only seam: exposes JobPlanStepHostCompute::resolveSymbolicArgs so
-  // that Python tests can verify the HostComputeArg ordering without needing
-  // a live HCM or device execution. Returns one integer (CompositeAddress*
-  // cast to uintptr_t) per resolved slot — same tensor yields the same
-  // integer, different tensor yields a different integer, so any ordering bug
-  // inside resolveSymbolicArgs is directly visible as a mismatched int vector.
+  // that Python tests can verify what each correction slot resolves to without
+  // needing a live HCM or device execution. Returns one integer per slot. An
+  // address slot gives the CompositeAddress* cast to uintptr_t, so the same
+  // tensor yields the same integer and a different tensor a different one, and
+  // a dimension slot gives the size itself. Any ordering bug inside
+  // resolveSymbolicArgs is therefore visible as a mismatched int vector.
   // The "_" prefix signals this is not part of the stable public API.
   m.def(
       "_resolve_symbolic_args",
@@ -707,18 +760,29 @@ PYBIND11_MODULE(_C, m) {
         const auto resolved =
             spyre::JobPlanStepHostCompute::resolveSymbolicArgs(tensors,
                                                                symbolic_args);
-        std::vector<uintptr_t> addrs;
-        addrs.reserve(resolved.size());
+        std::vector<uintptr_t> values;
+        values.reserve(resolved.size());
         for (const auto& host_arg : resolved) {
-          addrs.push_back(reinterpret_cast<uintptr_t>(
-              std::get<const flex::CompositeAddress*>(host_arg)));
+          // A slot holds an address or a size, so visit rather than naming one
+          // alternative: naming it throws on the other kind.
+          values.push_back(std::visit(
+              [](auto&& slot) -> uintptr_t {
+                using T = std::decay_t<decltype(slot)>;
+                if constexpr (std::is_pointer_v<T>) {
+                  return reinterpret_cast<uintptr_t>(slot);
+                } else {
+                  return static_cast<uintptr_t>(slot);
+                }
+              },
+              host_arg));
         }
-        return addrs;
+        return values;
       },
       py::arg("tensors"), py::arg("symbolic_args"),
-      "Test-only: resolve a symbolic_args payload to a list of device-address "
-      "integers (CompositeAddress* cast to uintptr_t). Same tensor yields the "
-      "same integer; different tensor yields a different integer.");
+      "Test-only: resolve a symbolic_args payload to a list of integers, one "
+      "per slot. An address slot gives the CompositeAddress* cast to uintptr_t "
+      "and a dimension slot gives the size. Same tensor yields the same "
+      "address integer; a different tensor yields a different one.");
 
   // ── Two-stream overlap: step-ordering validator + test hooks ──
 

@@ -73,7 +73,6 @@ from .scratchpad.lx_relayout import (
 from .pass_utils import (
     concretize_expr,
     op_read_writes,
-    compute_symbolic_bounds,
     finite_upper_or_none,
     iteration_space,
     iteration_space_with_splits,
@@ -1132,23 +1131,21 @@ class SpyreKernel(Kernel[CSEVariable]):
             # Reverse so index 0 = innermost level.
             tiled_syms = list(reversed(tiled_syms_per_level_outermost))
 
-        # Collect (max, granularity) bounds for any symbolic iteration-space
-        # dims. These are passed through OpSpec so SDSC codegen can emit
-        # symbolicDimInfo_ without needing the live ShapeEnv (which is gone
-        # during the codegen phase).
-        symbolic_dim_bounds: dict[str, tuple[int, int]] = {}
+        # A size with a declared maximum may vary at runtime, but an SDSC is
+        # built for one fixed size. The only way to vary it is a for_each_tile
+        # loop, whose body is a static tile and whose trip count carries the
+        # size. A size symbol without a declared maximum is specialised as before.
         for _, (size_expr, _) in it_space_extended.items():
             if not (hasattr(size_expr, "free_symbols") and size_expr.free_symbols):
                 continue
-            if finite_upper_or_none(size_expr) is None:
-                logger.debug(
-                    f"[work_division/symbolic] skipping auto-dynamic symbol "
-                    f"{size_expr}; use mark_dynamic(max=...) to enable symbolic planning"
+            upper = finite_upper_or_none(size_expr)
+            if upper is not None:
+                raise Unsupported(
+                    f"varying size {size_expr} (declared maximum {upper}) in the "
+                    f"iteration space of an op outside a for_each_tile loop is not "
+                    f"supported. Put the op inside for_each_tile so the size "
+                    f"becomes the loop's trip count."
                 )
-                continue
-            bounds = compute_symbolic_bounds(size_expr)
-            if bounds is not None:
-                symbolic_dim_bounds[str(size_expr)] = bounds
 
         # Provenance is a debug-only feature: a failure building the handle must
         # never break a compile. build_debug_handle is best-effort, but guard the
@@ -1207,7 +1204,6 @@ class SpyreKernel(Kernel[CSEVariable]):
             op_info,
             tiled_symbols=tiled_syms,
             tiled_symbol_trip_counts=tiled_symbol_trip_counts,
-            symbolic_dim_bounds=symbolic_dim_bounds,
             node_output_ranges=node_output_ranges,
             completed_producer_cores=(
                 relayout_plans[0].completed_producer_cores if relayout_plans else ()
@@ -1761,9 +1757,6 @@ def _codegen_op_spec_list(specs, buf: IndentedBuffer, sympy_str) -> None:
                         for dim, slot in op_spec.core_id_to_work_slice.items()
                     )
                     buf.writeline(f"core_id_to_work_slice={{{core_map}}},")
-                buf.writeline(
-                    f"symbolic_dim_bounds={_serialize_value(op_spec.symbolic_dim_bounds)},"
-                )
                 if op_spec.node_output_ranges is not None:
                     # Must survive the OpSpec -> generated-source -> exec
                     # round-trip: pool/conv codegen reads it to align dim labels

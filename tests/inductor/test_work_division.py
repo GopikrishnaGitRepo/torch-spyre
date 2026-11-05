@@ -2166,7 +2166,6 @@ class TestConvSpatialBlockedVars(unittest.TestCase):
             output_td,
             {},
             32,
-            {},
             {i, j},
             {},
         )
